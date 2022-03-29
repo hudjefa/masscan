@@ -27,12 +27,11 @@ endif
 # works on the bajillion of different Linux environments
 ifneq (, $(findstring linux, $(SYS)))
 ifneq (, $(findstring musl, $(SYS)))
-LIBS = 
-else
-LIBS = -lm -lrt -ldl -lpthread
+INCLUDES = -I/build/libpcap/include
+LDFLAGS = -static -L/build/libpcap/lib
 endif
-INCLUDES =
 FLAGS2 = 
+LIBS = -lm -lrt -ldl -lpthread -lpcap
 endif
 
 # MAC OS X
@@ -91,7 +90,13 @@ endif
 
 
 DEFINES = 
+
+ifneq (, $(findstring musl, $(SYS)))
+CFLAGS = -static -fPIC $(FLAGS2) $(INCLUDES) $(DEFINES) -Wall -O2
+else
 CFLAGS = -g -ggdb $(FLAGS2) $(INCLUDES) $(DEFINES) -Wall -O2
+endif
+
 .SUFFIXES: .c .cpp
 
 all: bin/masscan 
