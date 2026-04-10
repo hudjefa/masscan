@@ -6,7 +6,7 @@
 */
 #include "rawsock.h"
 #include "templ-pkt.h"
-#include "logger.h"
+#include "util-logger.h"
 #include "main-ptrace.h"
 #include "string_s.h"
 #include "pcap/pcap.h"
@@ -68,7 +68,7 @@ int pcap_setdirection(pcap_t *pcap, pcap_direction_t direction)
     if (real_setdirection == 0) {
         void* h = LoadLibraryA("wpcap.dll");
         if (h == NULL) {
-            fprintf(stderr, "couldn't load wpcap.dll: %u\n", 
+            fprintf(stderr, "couldn't load wpcap.dll: %u\n",
                                 (unsigned)GetLastError());
             return -1;
         }
@@ -76,7 +76,7 @@ int pcap_setdirection(pcap_t *pcap, pcap_direction_t direction)
         real_setdirection = (int (*)(pcap_t*,pcap_direction_t))
                             GetProcAddress(h, "pcap_setdirection");
         if (real_setdirection == 0) {
-            fprintf(stderr, "couldn't find pcap_setdirection(): %u\n", 
+            fprintf(stderr, "couldn't find pcap_setdirection(): %u\n",
                                 (unsigned)GetLastError());
             return -1;
         }
@@ -110,7 +110,6 @@ rawsock_init(void)
 /* variables used to print DHCP time info */
     //struct tm newtime;
     //char buffer[32];
-    //errno_t error;
 
     ULONG ulOutBufLen = sizeof (IP_ADAPTER_INFO);
     pAdapterInfo = (IP_ADAPTER_INFO *) malloc(sizeof (IP_ADAPTER_INFO));
@@ -145,15 +144,15 @@ rawsock_init(void)
                 if (name == NULL || addr == NULL)
                     exit(1);
 
-                sprintf_s(name, name_len, "\\Device\\NPF_%s", pAdapter->AdapterName);
+                snprintf(name, name_len, "\\Device\\NPF_%s", pAdapter->AdapterName);
 
                 //printf("\tAdapter Desc: \t%s\n", pAdapter->Description);
                 //printf("\tAdapter Addr: \t");
                 for (i = 0; i < pAdapter->AddressLength; i++) {
                     if (i == (pAdapter->AddressLength - 1))
-                        sprintf_s(addr+i*3, addr_len-i*3, "%.2X", pAdapter->Address[i]);
+                        snprintf(addr+i*3, addr_len-i*3, "%.2X", pAdapter->Address[i]);
                     else
-                        sprintf_s(addr+i*3, addr_len-i*3, "%.2X-", pAdapter->Address[i]);
+                        snprintf(addr+i*3, addr_len-i*3, "%.2X-", pAdapter->Address[i]);
                 }
                 //printf("%s  ->  %s\n", addr, name);
                 adapter_names[adapter_name_count].easy_name = addr;
@@ -170,8 +169,8 @@ rawsock_init(void)
                 char *addr = (char*)malloc(addr_len);
                 if (name == NULL || addr == NULL)
                     exit(1);
-                sprintf_s(name, name_len, "\\Device\\NPF_%s", pAdapter->AdapterName);
-                sprintf_s(addr, addr_len, "%s", pAdapter->IpAddressList.IpAddress.String);
+                snprintf(name, name_len, "\\Device\\NPF_%s", pAdapter->AdapterName);
+                snprintf(addr, addr_len, "%s", pAdapter->IpAddressList.IpAddress.String);
                 //printf("%s  ->  %s\n", addr, name);
                 adapter_names[adapter_name_count].easy_name = addr;
                 adapter_names[adapter_name_count].hard_name = name;
@@ -180,7 +179,7 @@ rawsock_init(void)
 
         }
     } else {
-        printf("GetAdaptersInfo failed with error: %u\n", 
+        printf("GetAdaptersInfo failed with error: %u\n",
                                                     (unsigned)dwRetVal);
 
     }
@@ -201,12 +200,12 @@ rawsock_list_adapters(void)
 {
     pcap_if_t *alldevs;
     char errbuf[PCAP_ERRBUF_SIZE];
-    
+
     if (pcap_findalldevs(&alldevs, errbuf) != -1) {
         int i;
         const pcap_if_t *d;
         i=0;
-        
+
         if (alldevs == NULL) {
             fprintf(stderr, "ERR:libpcap: no adapters found, are you sure you are root?\n");
         }
@@ -347,7 +346,7 @@ int rawsock_recv_packet(
     unsigned *usecs,
     const unsigned char **packet)
 {
-    
+
     if (adapter->ring) {
         /* This is for doing libpfring instead of libpcap */
         struct pfring_pkthdr hdr;
@@ -419,7 +418,7 @@ rawsock_send_probe_ipv4(
      */
     template_set_target_ipv4(tmplset, ip_them, port_them, ip_me, port_me, seqno,
         px, sizeof(px), &packet_length);
-    
+
     /*
      * Send it
      */
@@ -442,7 +441,7 @@ rawsock_send_probe_ipv6(
      */
     template_set_target_ipv6(tmplset, ip_them, port_them, ip_me, port_me, seqno,
         px, sizeof(px), &packet_length);
-    
+
     /*
      * Send it
      */
@@ -613,7 +612,7 @@ rawsock_init_adapter(const char *adapter_name,
 
     adapter->is_vlan = is_vlan;
     adapter->vlan_id = vlan_id;
-    
+
     if (is_offline)
         return adapter;
 
@@ -665,7 +664,7 @@ rawsock_init_adapter(const char *adapter_name,
         adapter->link_type = 1;
         if (adapter->ring == NULL) {
             LOG(0, "pfring:'%s': OPEN ERROR: %s\n",
-                adapter_name, strerror_x(errno));
+                adapter_name, strerror(errno));
             return 0;
         } else
             LOG(1, "pfring:'%s': successfully opened\n", adapter_name);
@@ -697,7 +696,7 @@ rawsock_init_adapter(const char *adapter_name,
         err = PFRING.enable_ring(adapter->ring);
         if (err != 0) {
                 LOG(0, "pfring: '%s': ENABLE ERROR: %s\n",
-                    adapter_name, strerror_x(errno));
+                    adapter_name, strerror(errno));
                 PFRING.close(adapter->ring);
                 adapter->ring = 0;
                 return 0;
@@ -727,7 +726,7 @@ rawsock_init_adapter(const char *adapter_name,
         LOG(1, "if:%s: pcap=%s\n", adapter_name, pcap_lib_version());
         LOG(2, "if:%s: opening...\n", adapter_name);
 
-        /* This reserves resources, but doesn't actually open the 
+        /* This reserves resources, but doesn't actually open the
          * adapter until we call pcap_activate */
         adapter->pcap = pcap_create(adapter_name, errbuf);
         if (adapter->pcap == NULL) {
@@ -790,7 +789,7 @@ rawsock_init_adapter(const char *adapter_name,
 
         LOG(1, "[+] if(%s): successfully opened\n", adapter_name);
 
-        
+
 
         /* Figure out the link-type. We suport Ethernet and IP */
         adapter->link_type = pcap_datalink(adapter->pcap);
@@ -947,7 +946,7 @@ rawsock_selftest_if(const char *ifname)
         /* IPv4 router MAC address */
         {
             macaddress_t router_mac = {{0,0,0,0,0,0}};
-            
+
             stack_arp_resolve(
                     adapter,
                     ipv4,
@@ -962,7 +961,7 @@ rawsock_selftest_if(const char *ifname)
                 printf("[+] router-mac-ipv4 = %s\n", fmt.string);
             }
         }
-        
+
 
         /*
          * IPv6 router MAC address.
@@ -972,7 +971,7 @@ rawsock_selftest_if(const char *ifname)
          */
         if (!ipv6address_is_zero(ipv6)) {
             macaddress_t router_mac = {{0,0,0,0,0,0}};
-            
+
             stack_ndpv6_resolve(
                     adapter,
                     ipv6,
@@ -987,7 +986,7 @@ rawsock_selftest_if(const char *ifname)
             }
         }
     }
-    
+
     rawsock_close_adapter(adapter);
     return 0;
 }

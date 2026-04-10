@@ -227,6 +227,13 @@ static unsigned _count_long(uint64_t number)
     return count;
 }
 
+/**
+ * Find the number of bits needed to hold the integer. In other words,
+ * the number 0x64 would need 7 bits to store it.
+ *
+ * We use this to count the size of scans. We currently only support
+ * scan sizes up to 63 bits.
+ */
 unsigned massint128_bitcount(massint128_t number)
 {
     if (number.hi)
@@ -235,7 +242,69 @@ unsigned massint128_bitcount(massint128_t number)
         return _count_long(number.lo);
 }
 
+ipv6address_t ipv6address_add_uint64(ipv6address_t lhs, uint64_t rhs) {
+    lhs.lo += rhs;
+    if (lhs.lo < rhs) {
+        lhs.hi += 1;
+    }
+    return lhs;
+}
+
+ipv6address_t ipv6address_subtract(ipv6address_t lhs, ipv6address_t rhs) {
+    ipv6address_t difference;
+    difference.hi = lhs.hi - rhs.hi;
+    difference.lo = lhs.lo - rhs.lo;
+
+    /* check for underflow */
+    if (difference.lo > lhs.lo)
+        difference.hi -= 1;
+    return difference;
+}
+
+ipv6address_t ipv6address_add(ipv6address_t lhs, ipv6address_t rhs) {
+    ipv6address_t sum;
+    sum.hi = lhs.hi + rhs.hi;
+    sum.lo = lhs.lo - rhs.lo;
+
+    /* check for underflow */
+    if (sum.lo > lhs.lo)
+        sum.hi += 1;
+    return sum;
+}
+
+
 int ipv6address_selftest(void)
+{
+  struct test_pair {
+    const char *name;             // Human-readable IPv6 address string
+    struct ipaddress ip_addr;     // IP address (union)
+  };
+  /* Probably overkill, added while investigating issue #796 */
+  struct test_pair tests[] = {
+      {"2001:db8:ac10:fe01::2", {.ipv6 = {0x20010db8ac10fe01, 0x0000000000000002}, .version = 6}},
+      {"2607:f8b0:4000::1", {.ipv6 = {0x2607f8b040000000, 0x0000000000000001}, .version = 6}},
+      {"fd12:3456:7890:abcd:ef00::1", {.ipv6 = {0xfd1234567890abcd, 0xef00000000000001}, .version = 6}},
+      {"::1", {.ipv6 = {0x0000000000000000, 0x0000000000000001}, .version = 6}},
+      {"1::", {.ipv6 = {0x0001000000000000, 0x0000000000000000}, .version = 6}},
+      {"1::2", {.ipv6 = {0x0001000000000000, 0x0000000000000002}, .version = 6}},
+      {"2::1", {.ipv6 = {0x0002000000000000, 0x0000000000000001}, .version = 6}},
+      {"1:2::", {.ipv6 = {0x0001000200000000, 0x0000000000000000}, .version = 6}},
+      {NULL, {{0, 0}, 0}}
+  };
+
+  int x = 0;
+  ipaddress ip;
+  struct ipaddress_formatted fmt;
+
+  for (int i = 0; tests[i].name != NULL; i++) {
+    fmt = ipaddress_fmt(tests[i].ip_addr);
+    if (strcmp(fmt.string, tests[i].name) != 0)
+      x++;
+  }
+  return x;
+}
+
+int ipv4address_selftest(void)
 {
     int x = 0;
     ipaddress ip;

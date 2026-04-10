@@ -8,8 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(WIN32)
+#ifdef _MSC_VER
 #pragma warning(disable:4996)
+#endif
+
+#if defined(WIN32)
 #define strncasecmp _strnicmp
 #endif
 
@@ -1079,7 +1082,7 @@ nmapserviceprobes_print(const struct NmapServiceProbeList *list, FILE *fp)
             fprintf(fp, " ");
             
             for (vi=match->versioninfo; vi; vi=vi->next) {
-                const char *tag = "";
+                const char *tag;
                 switch (vi->type) {
                     case SvcV_Unknown:          tag = "u"; break;
                     case SvcV_ProductName:      tag = "p"; break;
@@ -1089,6 +1092,7 @@ nmapserviceprobes_print(const struct NmapServiceProbeList *list, FILE *fp)
                     case SvcV_OperatingSystem:  tag = "o"; break;
                     case SvcV_DeviceType:       tag = "e"; break;
                     case SvcV_CpeName:          tag = "cpe:"; break;
+                    default: tag = "";
                 }
                 fprintf(fp, "%s", tag);
                 nmapserviceprobes_print_dstring(fp, vi->value, strlen(vi->value), '/');

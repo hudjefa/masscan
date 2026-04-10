@@ -14,8 +14,8 @@
 #include "masscan.h"
 #include "massip-addr.h"
 #include "masscan-version.h"
-#include "string_s.h"
-#include "logger.h"
+#include "util-safefunc.h"
+#include "util-logger.h"
 #include "proto-banner1.h"
 #include "templ-payloads.h"
 #include "crypto-base64.h"
@@ -27,6 +27,7 @@
 #include "massip.h"
 #include "massip-parse.h"
 #include "massip-port.h"
+#include "templ-opts.h"
 #include <ctype.h>
 #include <limits.h>
 
@@ -66,15 +67,20 @@ static struct Range top_ports_sctp[] = {
 void
 masscan_usage(void)
 {
-    printf("usage:\n");
-    printf("masscan -p80,8000-8100 10.0.0.0/8 --rate=10000\n");
-    printf(" scan some web ports on 10.x.x.x at 10kpps\n");
-    printf("masscan --nmap\n");
-    printf(" list those options that are compatible with nmap\n");
-    printf("masscan -p80 10.0.0.0/8 --banners -oB <filename>\n");
-    printf(" save results of scan in binary format to <filename>\n");
-    printf("masscan --open --banners --readscan <filename> -oX <savefile>\n");
-    printf(" read binary scan results in <filename> and save them as xml in <savefile>\n");
+    printf("usage: masscan [options] [<IP|RANGE>... -pPORT[,PORT...]]\n");
+    printf("\n");
+    printf("examples:\n");
+    printf("    masscan -p80,8000-8100 10.0.0.0/8 --rate=10000\n");
+    printf("        scan some web ports on 10.x.x.x at 10kpps\n");
+    printf("\n");
+    printf("    masscan --nmap\n");
+    printf("        list those options that are compatible with nmap\n");
+    printf("\n");
+    printf("    masscan -p80 10.0.0.0/8 --banners -oB <filename>\n");
+    printf("        save results of scan in binary format to <filename>\n");
+    printf("\n");
+    printf("    masscan --open --banners --readscan <filename> -oX <savefile>\n");
+    printf("        read binary scan results in <filename> and save them as xml in <savefile>\n");
     exit(1);
 }
 
@@ -93,6 +99,10 @@ print_version()
         "https://github.com/robertdavidgraham/masscan"
         );
     printf("Compiled on: %s %s\n", __DATE__, __TIME__);
+
+#if defined(__x86_64) || defined(__x86_64__)
+    cpu = "x86";
+#endif
 
 #if defined(_MSC_VER)
     #if defined(_M_AMD64) || defined(_M_X64)
@@ -122,9 +132,13 @@ print_version()
             compiler_version = "post-2013";
     }
 
-
+    
 #elif defined(__GNUC__)
+# if defined(__clang__)
+    compiler = "clang";
+# else
     compiler = "gcc";
+# endif
     compiler_version = __VERSION__;
 
 #if defined(i386) || defined(__i386) || defined(__i386__)
@@ -223,46 +237,51 @@ print_nmap_help(void)
 "\n");
 }
 
-/***************************************************************************
- ***************************************************************************/
-static unsigned
-count_cidr_bits(struct Range range)
-{
-    unsigned i;
-
-    for (i=0; i<32; i++) {
-        unsigned mask = 0xFFFFFFFF >> i;
-
-        if ((range.begin & ~mask) == (range.end & ~mask)) {
-            if ((range.begin & mask) == 0 && (range.end & mask) == mask)
-                return i;
-        }
-    }
-
-    return 0;
-}
 
 /***************************************************************************
  ***************************************************************************/
 static unsigned
-count_cidr6_bits(struct Range6 range)
+count_cidr6_bits(struct Range6 *range, bool *exact)
 {
     uint64_t i;
 
-    /* Kludge: can't handle more than 64-bits of CIDR ranges */
-    if (range.begin.hi != range.begin.lo)
-        return 0;
-
-    for (i=0; i<64; i++) {
-        uint64_t mask = 0xFFFFFFFFffffffffull >> i;
-
-        if ((range.begin.lo & ~mask) == (range.end.lo & ~mask)) {
-            if ((range.begin.lo & mask) == 0 && (range.end.lo & mask) == mask)
-                return (unsigned)i;
+    /* for the comments of this function, see  count_cidr_bits */
+    *exact = false;
+    
+    for (i=0; i<128; i++) {
+        uint64_t mask_hi;
+        uint64_t mask_lo;
+        if (i < 64) {
+            mask_hi = 0xFFFFFFFFffffffffull >> i;
+            mask_lo = 0xFFFFFFFFffffffffull;
+        } else {
+            mask_hi = 0;
+            mask_lo = 0xFFFFFFFFffffffffull >> (i - 64);
+        }
+        if ((range->begin.hi & mask_hi) != 0 || (range->begin.lo & mask_lo) != 0) {
+            continue;
+        }
+        if ((range->begin.hi & ~mask_hi) == (range->end.hi & ~mask_hi) &&
+                (range->begin.lo & ~mask_lo) == (range->end.lo & ~mask_lo)) {
+            if (((range->end.hi & mask_hi) == mask_hi) && ((range->end.lo & mask_lo) == mask_lo)) {
+                *exact = true;
+                return (unsigned) i;
+            }
+        } else {
+            *exact = false;
+            range->begin.hi = range->begin.hi + mask_hi;
+            if (range->begin.lo >= 0xffffffffffffffff - 1 - mask_lo) {
+                range->begin.hi += 1;
+            }
+            range->begin.lo = range->begin.lo + mask_lo + 1;
+            return (unsigned) i;
         }
     }
-
-    return 0;
+    range->begin.lo = range->begin.lo + 1;
+    if (range->begin.lo == 0) {
+        range->begin.hi = range->begin.hi + 1;
+    }
+    return 128;
 }
 
 
@@ -281,7 +300,7 @@ masscan_echo_nic(struct Masscan *masscan, FILE *fp, unsigned i)
     if (masscan->nic_count <= 1)
         idx_str[0] = '\0';
     else
-        sprintf_s(idx_str, sizeof(idx_str), "[%u]", i);
+        snprintf(idx_str, sizeof(idx_str), "[%u]", i);
 
     if (masscan->nic[i].ifname[0])
         fprintf(fp, "adapter%s = %s\n", idx_str, masscan->nic[i].ifname);
@@ -376,17 +395,16 @@ masscan_save_state(struct Masscan *masscan)
 {
     char filename[512];
     FILE *fp;
-    int err;
 
-
-    strcpy_s(filename, sizeof(filename), "paused.conf");
+    safe_strcpy(filename, sizeof(filename), "paused.conf");
     fprintf(stderr, "                                   "
                     "                                   \r");
     fprintf(stderr, "saving resume file to: %s\n", filename);
 
-    err = fopen_s(&fp, filename, "wt");
-    if (err) {
-        perror(filename);
+    fp = fopen(filename, "wt");
+    if (fp == NULL) {
+        fprintf(stderr, "[-] FAIL: saving resume file\n");
+        fprintf(stderr, "[-] %s: %s\n", filename, strerror(errno));
         return;
     }
 
@@ -413,11 +431,10 @@ static void
 ranges_from_file(struct RangeList *ranges, const char *filename)
 {
     FILE *fp;
-    errno_t err;
     unsigned line_number = 0;
 
-    err = fopen_s(&fp, filename, "rt");
-    if (err) {
+    fp = fopen(filename, "rt");
+    if (fp) {
         perror(filename);
         exit(1); /* HARD EXIT: because if it's an exclusion file, we don't
                   * want to continue. We don't want ANY chance of
@@ -566,6 +583,75 @@ parseInt(const char *str)
     return result;
 }
 
+/**
+ * a stricter function for determining if something is boolean.
+ */
+static bool
+isBoolean(const char *str) {
+    size_t length = str?strlen(str):0;
+
+    if (length == 0)
+        return false;
+
+    /* "0" or "1" is boolean */
+    if (isdigit(str[0])) {
+        if (strtoul(str,0,0) == 0)
+            return true;
+        else if (strtoul(str,0,0) == 1)
+            return true;
+        else
+            return false;
+    }
+
+    switch (str[0]) {
+        case 'e':
+        case 'E':
+            if (memcasecmp("enable", str, length)==0)
+                return true;
+            if (memcasecmp("enabled", str, length)==0)
+                return true;
+            return false;
+        case 'd':
+        case 'D':
+            if (memcasecmp("disable", str, length)==0)
+                return true;
+            if (memcasecmp("disabled", str, length)==0)
+                return true;
+            return false;
+
+        case 't':
+        case 'T':
+            if (memcasecmp("true", str, length)==0)
+                return true;
+            return false;
+        case 'f':
+        case 'F':
+            if (memcasecmp("false", str, length)==0)
+                return true;
+            return false;
+
+        case 'o':
+        case 'O':
+            if (memcasecmp("on", str, length)==0)
+                return true;
+            if (memcasecmp("off", str, length)==0)
+                return true;
+            return false;
+        case 'Y':
+        case 'y':
+            if (memcasecmp("yes", str, length)==0)
+                return true;
+            return false;
+        case 'n':
+        case 'N':
+            if (memcasecmp("no", str, length)==0)
+                return true;
+            return false;
+        default:
+            return false;
+    }
+}
+
 static unsigned
 parseBoolean(const char *str)
 {
@@ -578,23 +664,32 @@ parseBoolean(const char *str)
             return 1;
     }
     switch (str[0]) {
-    case 't':
+    case 'e': /* enable */
+    case 'E':
+        return 1;
+    case 'd': /* disable */
+    case 'D':
+        return 0;
+
+    case 't': /* true */
     case 'T':
         return 1;
-    case 'f':
+    case 'f': /* false */
     case 'F':
         return 0;
-    case 'o':
+
+    case 'o': /* on or off */
     case 'O':
         if (str[1] == 'f' || str[1] == 'F')
             return 0;
         else
             return 1;
         break;
-    case 'Y':
+
+    case 'Y': /* yes */
     case 'y':
         return 1;
-    case 'n':
+    case 'n': /* no */
     case 'N':
         return 0;
     }
@@ -793,32 +888,96 @@ ARRAY(const char *rhs)
     return (unsigned)parseInt(p);
 }
 
+/**
+ * Called if user specified `--top-ports` on the command-line.
+ */
 static void
-config_top_ports(struct Masscan *masscan, unsigned n)
+config_top_ports(struct Masscan *masscan, unsigned maxports)
 {
     unsigned i;
+    static const unsigned short top_udp_ports[] = {
+        161, /* SNMP - should be found on all network equipment */
+        135, /* MS-RPC - should be found on all modern Windows */
+        500, /* ISAKMP - for establishing IPsec tunnels */
+        137, /* NetBIOS-NameService - should be found on old Windows */
+        138, /* NetBIOS-Datagram - should be found on old Windows */
+        445, /* SMB datagram service */
+        67, /* DHCP */
+        53, /* DNS */
+        1900, /* UPnP - Microsoft-focused local discovery */
+        5353, /* mDNS - Apple-focused local discovery */
+        4500, /* nat-t-ike - IPsec NAT traversal */
+        514, /* syslog - all Unix machiens */
+        69, /* TFTP */
+        49152, /* first of modern ephemeral ports */
+        631, /* IPP - printing protocol for Linux */
+        123, /* NTP network time protocol */
+        1434, /* MS-SQL server*/
+        520, /* RIP - routers use this protocol sometimes */
+        7, /* Echo */
+        111, /* SunRPC portmapper */
+        2049, /* SunRPC NFS */
+        5683, /* COAP */
+        11211, /* memcached */
+        1701, /* L2TP */
+        27960, /* quaked amplifier */
+        1645, /* RADIUS */
+        1812, /* RADIUS */
+        1646, /* RADIUS */
+        1813, /* RADIUS */
+        3343, /* Microsoft Cluster Services */
+        2535, /* MADCAP rfc2730 TODO FIXME */
+        
+    };
+
     static const unsigned short top_tcp_ports[] = {
-        1,3,4,6,7,9,13,17,19,20,21,22,23,24,25,26,30,32,33,37,42,43,49,53,70,
-        79,80,81,82,83,84,85,88,89,90,99,100,106,109,110,111,113,119,125,135,
-        139,143,144,146,161,163,179,199,211,212,222,254,255,256,259,264,280,
-        301,306,311,340,366,389,406,407,416,417,425,427,443,444,445,458,464,
-        465,481,497,500,512,513,514,515,524,541,543,544,545,548,554,555,563,
-        587,593,616,617,625,631,636,646,648,666,667,668,683,687,691,700,705,
+        80, 443, 8080,   /* also web */
+        21, 990,     /* FTP, oldie but goodie */
+        22,     /* SSH, so much infrastructure */
+        23, 992,     /* Telnet, oldie but still around*/
+        24,     /* people put things here instead of TelnetSSH*/
+        25, 465, 587, 2525,     /* SMTP email*/
+        5800, 5900, 5901, /* VNC */
+        111,    /* SunRPC */
+        139, 445, /* Microsoft Windows networking */
+        135,    /* DCEPRC, more Microsoft Windows */
+        3389,   /* Microsoft Windows RDP */
+        88,     /* Kerberos, also Microsoft windows */
+        389, 636,    /* LDAP and MS Win */
+        1433,   /* MS SQL */
+        53,     /* DNS */
+        2083, 2096,   /* cPanel */
+        9050,   /* ToR */
+        8140,   /* Puppet */
+        11211,  /* memcached */
+        1098, 1099, /* Java RMI */
+        6000, 6001, /* XWindows */
+        5060, 5061, /* SIP - session initiation protocool */
+        554,    /* RTSP */
+        548,    /* AFP */
+        
+
+        1,3,4,6,7,9,13,17,19,20,26,30,32,33,37,42,43,49,70,
+        79,81,82,83,84,85,89,90,99,100,106,109,110,113,119,125,
+        143,144,146,161,163,179,199,211,212,222,254,255,256,259,264,280,
+        301,306,311,340,366,406,407,416,417,425,427,444,458,464,
+        465,481,497,500,512,513,514,515,524,541,543,544,545,554,555,563,
+        593,616,617,625,631,646,648,666,667,668,683,687,691,700,705,
         711,714,720,722,726,749,765,777,783,787,800,801,808,843,873,880,888,
-        898,900,901,902,903,911,912,981,987,990,992,993,995,999,1000,1001,
+        898,900,901,902,903,911,912,981,987,993,995,999,1000,1001,
         1002,1007,1009,1010,1011,1021,1022,1023,1024,1025,1026,1027,1028,
         1029,1030,1031,1032,1033,1034,1035,1036,1037,1038,1039,1040,1041,
         1042,1043,1044,1045,1046,1047,1048,1049,1050,1051,1052,1053,1054,
         1055,1056,1057,1058,1059,1060,1061,1062,1063,1064,1065,1066,1067,
         1068,1069,1070,1071,1072,1073,1074,1075,1076,1077,1078,1079,1080,
         1081,1082,1083,1084,1085,1086,1087,1088,1089,1090,1091,1092,1093,
-        1094,1095,1096,1097,1098,1099,1100,1102,1104,1105,1106,1107,1108,
+        1094,1095,1096,1097,1100,1102,1104,1105,1106,1107,1108,
         1110,1111,1112,1113,1114,1117,1119,1121,1122,1123,1124,1126,1130,
         1131,1132,1137,1138,1141,1145,1147,1148,1149,1151,1152,1154,1163,
         1164,1165,1166,1169,1174,1175,1183,1185,1186,1187,1192,1198,1199,
         1201,1213,1216,1217,1218,1233,1234,1236,1244,1247,1248,1259,1271,
         1272,1277,1287,1296,1300,1301,1309,1310,1311,1322,1328,1334,1352,
-        1417,1433,1434,1443,1455,1461,1494,1500,1501,1503,1521,1524,1533,
+        1417,1434,1443,1455,1461,1494,1500,1501,1503,1521,1524,1533,
         1556,1580,1583,1594,1600,1641,1658,1666,1687,1688,1700,1717,1718,
         1719,1720,1721,1723,1755,1761,1782,1783,1801,1805,1812,1839,1840,
         1862,1863,1864,1875,1900,1914,1935,1947,1971,1972,1974,1984,1998,
@@ -827,7 +986,7 @@ config_top_ports(struct Masscan *masscan, unsigned n)
         2046,2047,2048,2049,2065,2068,2099,2100,2103,2105,2106,2107,2111,
         2119,2121,2126,2135,2144,2160,2161,2170,2179,2190,2191,2196,2200,
         2222,2251,2260,2288,2301,2323,2366,2381,2382,2383,2393,2394,2399,
-        2401,2492,2500,2522,2525,2557,2601,2602,2604,2605,2607,2608,2638,
+        2401,2492,2500,2522,2557,2601,2602,2604,2605,2607,2608,2638,
         2701,2702,2710,2717,2718,2725,2800,2809,2811,2869,2875,2909,2910,
         2920,2967,2968,2998,3000,3001,3003,3005,3006,3007,3011,3013,3017,
         3030,3031,3052,3071,3077,3128,3168,3211,3221,3260,3261,3268,3269,
@@ -838,13 +997,13 @@ config_top_ports(struct Masscan *masscan, unsigned n)
         3995,3998,4000,4001,4002,4003,4004,4005,4006,4045,4111,4125,4126,
         4129,4224,4242,4279,4321,4343,4443,4444,4445,4446,4449,4550,4567,
         4662,4848,4899,4900,4998,5000,5001,5002,5003,5004,5009,5030,5033,
-        5050,5051,5054,5060,5061,5080,5087,5100,5101,5102,5120,5190,5200,
+        5050,5051,5054,5080,5087,5100,5101,5102,5120,5190,5200,
         5214,5221,5222,5225,5226,5269,5280,5298,5357,5405,5414,5431,5432,
         5440,5500,5510,5544,5550,5555,5560,5566,5631,5633,5666,5678,5679,
-        5718,5730,5800,5801,5802,5810,5811,5815,5822,5825,5850,5859,5862,
-        5877,5900,5901,5902,5903,5904,5906,5907,5910,5911,5915,5922,5925,
-        5950,5952,5959,5960,5961,5962,5963,5987,5988,5989,5998,5999,6000,
-        6001,6002,6003,6004,6005,6006,6007,6009,6025,6059,6100,6101,6106,
+        5718,5730,5801,5802,5810,5811,5815,5822,5825,5850,5859,5862,
+        5877,5902,5903,5904,5906,5907,5910,5911,5915,5922,5925,
+        5950,5952,5959,5960,5961,5962,5963,5987,5988,5989,5998,5999,
+        6002,6003,6004,6005,6006,6007,6009,6025,6059,6100,6101,6106,
         6112,6123,6129,6156,6346,6389,6502,6510,6543,6547,6565,6566,6567,
         6580,6646,6666,6667,6668,6669,6689,6692,6699,6779,6788,6789,6792,
         6839,6881,6901,6969,7000,7001,7002,7004,7007,7019,7025,7070,7100,
@@ -854,7 +1013,7 @@ config_top_ports(struct Masscan *masscan, unsigned n)
         8084,8085,8086,8087,8088,8089,8090,8093,8099,8100,8180,8181,8192,
         8193,8194,8200,8222,8254,8290,8291,8292,8300,8333,8383,8400,8402,
         8443,8500,8600,8649,8651,8652,8654,8701,8800,8873,8888,8899,8994,
-        9000,9001,9002,9003,9009,9010,9011,9040,9050,9071,9080,9081,9090,
+        9000,9001,9002,9003,9009,9010,9011,9040,9071,9080,9081,9090,
         9091,9099,9100,9101,9102,9103,9110,9111,9200,9207,9220,9290,9415,
         9418,9485,9500,9502,9503,9535,9575,9593,9594,9595,9618,9666,9876,
         9877,9878,9898,9900,9917,9929,9943,9944,9968,9998,9999,10000,10001,
@@ -876,14 +1035,24 @@ config_top_ports(struct Masscan *masscan, unsigned n)
         57797,58080,60020,60443,61532,61900,62078,63331,64623,64680,65000,
         65129,65389};
     struct RangeList *ports = &masscan->targets.ports;
+    static const unsigned max_tcp_ports = sizeof(top_tcp_ports)/sizeof(top_tcp_ports[0]);
+    static const unsigned max_udp_ports = sizeof(top_udp_ports)/sizeof(top_udp_ports[0]);
+
 
     if (masscan->scan_type.tcp) {
-        for (i=0; i<n && i<sizeof(top_tcp_ports)/sizeof(top_tcp_ports[0]); i++)
-            rangelist_add_range(ports, top_tcp_ports[i], top_tcp_ports[i]);
+        LOG(2, "[+] adding TCP top-ports = %u\n", maxports);
+        for (i=0; i<maxports && i<max_tcp_ports; i++)
+            rangelist_add_range_tcp(ports,
+                                top_tcp_ports[i],
+                                top_tcp_ports[i]);
     }
+
     if (masscan->scan_type.udp) {
-        for (i=0; i<n && i<sizeof(top_tcp_ports)/sizeof(top_tcp_ports[0]); i++)
-            rangelist_add_range(ports, top_tcp_ports[i], top_tcp_ports[i]);
+        LOG(2, "[+] adding UDP top-ports = %u\n", maxports);
+        for (i=0; i<maxports && i<max_udp_ports; i++)
+            rangelist_add_range_udp(ports,
+                                top_udp_ports[i],
+                                top_udp_ports[i]);
     }
 
     /* Targets must be sorted after every change, before being used */
@@ -942,6 +1111,20 @@ static int SET_banners(struct Masscan *masscan, const char *name, const char *va
        return 0;
     }
     masscan->is_banners = parseBoolean(value);
+    return CONF_OK;
+}
+
+static int SET_banners_rawudp(struct Masscan *masscan, const char *name, const char *value)
+{
+    UNUSEDPARM(name);
+    if (masscan->echo) {
+        if (masscan->is_banners_rawudp || masscan->echo_all)
+            fprintf(masscan->echo, "rawudp = %s\n", masscan->is_banners_rawudp?"true":"false");
+       return 0;
+    }
+    masscan->is_banners_rawudp = parseBoolean(value);
+    if (masscan->is_banners_rawudp)
+        masscan->is_banners = true;
     return CONF_OK;
 }
 
@@ -1024,7 +1207,6 @@ static int SET_hello_file(struct Masscan *masscan, const char *name, const char 
 {
     unsigned index;
     FILE *fp;
-    int x;
     char buf[16384];
     char buf2[16384];
     size_t bytes_read;
@@ -1044,10 +1226,10 @@ static int SET_hello_file(struct Masscan *masscan, const char *name, const char 
     }
 
     /* When connecting via TCP, send this file */
-    x = fopen_s(&fp, value, "rb");
-    if (x != 0) {
-        LOG(0, "[FAILED] could not read hello file\n");
-        perror(value);
+    fp = fopen(value, "rb");
+    if (fp == NULL) {
+        LOG(0, "[-] [FAILED] --hello-file\n");
+        LOG(0, "[-] %s: %s\n", value, strerror(errno));
         return CONF_ERR;
     }
     
@@ -1063,7 +1245,7 @@ static int SET_hello_file(struct Masscan *masscan, const char *name, const char 
     bytes_encoded = base64_encode(buf2, sizeof(buf2)-1, buf, bytes_read);
     buf2[bytes_encoded] = '\0';
     
-    sprintf_s(foo, sizeof(foo), "hello-string[%u]", (unsigned)index);
+    snprintf(foo, sizeof(foo), "hello-string[%u]", (unsigned)index);
     
     masscan_set_parameter(masscan, foo, buf2);
 
@@ -1455,7 +1637,7 @@ static int SET_output_filename(struct Masscan *masscan, const char *name, const 
     }
     if (masscan->output.format == 0)
         masscan->output.format = Output_XML; /*TODO: Why is the default XML?*/
-    strcpy_s(masscan->output.filename,
+    safe_strcpy(masscan->output.filename,
              sizeof(masscan->output.filename),
              value);
     return CONF_OK;
@@ -1625,7 +1807,7 @@ static int SET_pcap_filename(struct Masscan *masscan, const char *name, const ch
         return 0;
     }
     if (value)
-        strcpy_s(masscan->pcap_filename, sizeof(masscan->pcap_filename), value);
+        safe_strcpy(masscan->pcap_filename, sizeof(masscan->pcap_filename), value);
     return CONF_OK;
 }
 
@@ -1779,7 +1961,7 @@ static int SET_rotate_directory(struct Masscan *masscan, const char *name, const
         }
         return 0;
     }
-    strcpy_s(   masscan->output.rotate.directory,
+    safe_strcpy(   masscan->output.rotate.directory,
              sizeof(masscan->output.rotate.directory),
              value);
     /* strip trailing slashes */
@@ -1906,7 +2088,259 @@ static int SET_output_stylesheet(struct Masscan *masscan, const char *name, cons
     if (masscan->output.format == 0)
         masscan->output.format = Output_XML;
     
-    strcpy_s(masscan->output.stylesheet, sizeof(masscan->output.stylesheet), value);
+    safe_strcpy(masscan->output.stylesheet, sizeof(masscan->output.stylesheet), value);
+    return CONF_OK;
+}
+
+static int SET_topports(struct Masscan *masscan, const char *name, const char *value)
+{
+    unsigned default_value = 20;
+
+    if (masscan->echo) {
+        /* don't echo: this instead triggers filling the `--port`
+         * list, so the ports themselves will be echoed, not this
+         * parameter */
+        return 0;
+    }
+
+    if (value == 0 || value[0] == '\0') {
+        /* can be specified by itself on the command-line, alone
+         * without a following parameter */
+        /* ex: `--top-ports` */
+        masscan->top_ports = default_value;
+    } else if (isBoolean(value)) {
+        /* ex: `--top-ports enable` */
+        if (parseBoolean(value))
+            masscan->top_ports = default_value;
+        else
+            masscan->top_ports = 0;
+    } else if (isInteger(value)) {
+        /* ex: `--top-ports 5` */
+        uint64_t num = parseInt(value);
+        masscan->top_ports = (unsigned)num;
+    } else {
+        fprintf(stderr, "[-] %s: bad value: %s\n", name, value);
+        return CONF_ERR;
+    }
+    return CONF_OK;
+}
+
+static int SET_tcp_mss(struct Masscan *masscan, const char *name, const char *value)
+{
+    /* h/t @IvreRocks */
+    static const unsigned default_mss = 1460;
+
+    if (masscan->echo) {
+        if (masscan->templ_opts) {
+            switch (masscan->templ_opts->tcp.is_mss) {
+                case Default:
+                    break;
+                case Add:
+                    if (masscan->templ_opts->tcp.mss == default_mss)
+                        fprintf(masscan->echo, "tcp-mss = %s\n", "enable");
+                    else
+                        fprintf(masscan->echo, "tcp-mss = %u\n",
+                                masscan->templ_opts->tcp.mss);
+                    break;
+                case Remove:
+                    fprintf(masscan->echo, "tcp-mss = %s\n", "disable");
+                    break;
+                default:
+                    break;
+            }
+        }
+        return 0;
+    }
+
+    if (masscan->templ_opts == NULL)
+        masscan->templ_opts = calloc(1, sizeof(*masscan->templ_opts));
+
+    if (value == 0 || value[0] == '\0') {
+        /* no following parameter, so interpret this to mean "enable" */
+        masscan->templ_opts->tcp.is_mss = Add;
+        masscan->templ_opts->tcp.mss = default_mss; /* 1460 */
+    } else if (isBoolean(value)) {
+        /* looking for "enable" or "disable", but any boolean works,
+         * like "true/false" or "off/on" */
+        if (parseBoolean(value)) {
+            masscan->templ_opts->tcp.is_mss = Add;
+            masscan->templ_opts->tcp.mss = default_mss; /* 1460 */
+        } else
+            masscan->templ_opts->tcp.is_mss = Remove;
+    } else if (isInteger(value)) {
+        /* A specific number was specified */
+        uint64_t num = parseInt(value);
+        if (num >= 0x10000)
+            goto fail;
+        masscan->templ_opts->tcp.is_mss = Add;
+        masscan->templ_opts->tcp.mss = (unsigned)num;
+    } else
+        goto fail;
+
+    return CONF_OK;
+fail:
+    fprintf(stderr, "[-] %s: bad value: %s\n", name, value);
+    return CONF_ERR;
+}
+
+static int SET_tcp_wscale(struct Masscan *masscan, const char *name, const char *value)
+{
+    static const unsigned default_value = 3;
+
+    if (masscan->echo) {
+        if (masscan->templ_opts) {
+            switch (masscan->templ_opts->tcp.is_wscale) {
+                case Default:
+                    break;
+                case Add:
+                    if (masscan->templ_opts->tcp.wscale == default_value)
+                        fprintf(masscan->echo, "tcp-wscale = %s\n", "enable");
+                    else
+                        fprintf(masscan->echo, "tcp-wscale = %u\n",
+                                masscan->templ_opts->tcp.wscale);
+                    break;
+                case Remove:
+                    fprintf(masscan->echo, "tcp-wscale = %s\n", "disable");
+                    break;
+                default:
+                    break;
+            }
+        }
+        return 0;
+    }
+
+    if (masscan->templ_opts == NULL)
+        masscan->templ_opts = calloc(1, sizeof(*masscan->templ_opts));
+
+    if (value == 0 || value[0] == '\0') {
+        masscan->templ_opts->tcp.is_wscale = Add;
+        masscan->templ_opts->tcp.wscale = default_value;
+    } else if (isBoolean(value)) {
+        if (parseBoolean(value)) {
+            masscan->templ_opts->tcp.is_wscale = Add;
+            masscan->templ_opts->tcp.wscale = default_value;
+        } else
+            masscan->templ_opts->tcp.is_wscale = Remove;
+    } else if (isInteger(value)) {
+        uint64_t num = parseInt(value);
+        if (num >= 255)
+            goto fail;
+        masscan->templ_opts->tcp.is_wscale = Add;
+        masscan->templ_opts->tcp.wscale = (unsigned)num;
+    } else
+        goto fail;
+
+    return CONF_OK;
+fail:
+    fprintf(stderr, "[-] %s: bad value: %s\n", name, value);
+    return CONF_ERR;
+}
+
+static int SET_tcp_tsecho(struct Masscan *masscan, const char *name, const char *value)
+{
+    static const unsigned default_value = 0x12345678;
+
+    if (masscan->echo) {
+        if (masscan->templ_opts) {
+            switch (masscan->templ_opts->tcp.is_tsecho) {
+                case Default:
+                    break;
+                case Add:
+                    if (masscan->templ_opts->tcp.tsecho == default_value)
+                        fprintf(masscan->echo, "tcp-tsecho = %s\n", "enable");
+                    else
+                        fprintf(masscan->echo, "tcp-tsecho = %u\n",
+                                masscan->templ_opts->tcp.tsecho);
+                    break;
+                case Remove:
+                    fprintf(masscan->echo, "tcp-tsecho = %s\n", "disable");
+                    break;
+                default:
+                    break;
+            }
+        }
+        return 0;
+    }
+
+    if (masscan->templ_opts == NULL)
+        masscan->templ_opts = calloc(1, sizeof(*masscan->templ_opts));
+
+    if (value == 0 || value[0] == '\0') {
+        masscan->templ_opts->tcp.is_tsecho = Add;
+        masscan->templ_opts->tcp.tsecho = default_value;
+    } else if (isBoolean(value)) {
+        if (parseBoolean(value)) {
+            masscan->templ_opts->tcp.is_tsecho = Add;
+            masscan->templ_opts->tcp.tsecho = default_value;
+        } else
+            masscan->templ_opts->tcp.is_tsecho = Remove;
+    } else if (isInteger(value)) {
+        uint64_t num = parseInt(value);
+        if (num >= 255)
+            goto fail;
+        masscan->templ_opts->tcp.is_tsecho = Add;
+        masscan->templ_opts->tcp.tsecho = (unsigned)num;
+    } else
+        goto fail;
+
+    return CONF_OK;
+fail:
+    fprintf(stderr, "[-] %s: bad value: %s\n", name, value);
+    return CONF_ERR;
+}
+
+static int SET_tcp_sackok(struct Masscan *masscan, const char *name, const char *value)
+{
+    if (masscan->echo) {
+        if (masscan->templ_opts) {
+            switch (masscan->templ_opts->tcp.is_sackok) {
+                case Default:
+                    break;
+                case Add:
+                    fprintf(masscan->echo, "tcp-sackok = %s\n", "enable");
+                    break;
+                case Remove:
+                    fprintf(masscan->echo, "tcp-sackok = %s\n", "disable");
+                    break;
+                default:
+                    break;
+            }
+        }
+        return 0;
+    }
+
+    if (masscan->templ_opts == NULL)
+        masscan->templ_opts = calloc(1, sizeof(*masscan->templ_opts));
+
+    if (value == 0 || value[0] == '\0') {
+        masscan->templ_opts->tcp.is_sackok = Add;
+    } else if (isBoolean(value)) {
+        if (parseBoolean(value)) {
+            masscan->templ_opts->tcp.is_sackok = Add;
+        } else
+            masscan->templ_opts->tcp.is_sackok = Remove;
+    } else if (isInteger(value)) {
+        if (parseInt(value) != 0)
+            masscan->templ_opts->tcp.is_sackok = Add;
+    } else
+        goto fail;
+
+    return CONF_OK;
+fail:
+    fprintf(stderr, "[-] %s: bad value: %s\n", name, value);
+    return CONF_ERR;
+}
+
+
+static int SET_debug_tcp(struct Masscan *masscan, const char *name, const char *value) {
+    extern int is_tcp_debug; /* global */
+    UNUSEDPARM(name);
+    UNUSEDPARM(masscan);
+
+    if (value == 0 || value[0] == '\0')
+        is_tcp_debug = 1;
+    else
+        is_tcp_debug = parseBoolean(value);
     return CONF_OK;
 }
 
@@ -1918,7 +2352,7 @@ struct ConfigParameter {
     unsigned flags;
     const char *alts[6];
 };
-enum {F_NONE, F_BOOL};
+enum {F_NONE, F_BOOL=1, F_NUMABLE=2};
 struct ConfigParameter config_parameters[] = {
     {"resume-index",    SET_resume_index,       0,      {0}},
     {"resume-count",    SET_resume_count,       0,      {0}},
@@ -1927,7 +2361,8 @@ struct ConfigParameter config_parameters[] = {
     {"randomize-hosts", SET_randomize_hosts,    F_BOOL, {0}},
     {"rate",            SET_rate,               0,      {"max-rate",0}},
     {"shard",           SET_shard,              0,      {"shards",0}},
-    {"banners",         SET_banners,            F_BOOL, {"banner",0}},
+    {"banners",         SET_banners,            F_BOOL, {"banner",0}}, /* --banners */
+    {"rawudp",          SET_banners_rawudp,     F_BOOL, {"rawudp",0}}, /* --rawudp */
     {"nobanners",       SET_nobanners,          F_BOOL, {"nobanner",0}},
     {"retries",         SET_retries,            0,      {"retry", "max-retries", "max-retry", 0}},
     {"noreset",         SET_noreset,            F_BOOL, {0}},
@@ -1952,7 +2387,7 @@ struct ConfigParameter config_parameters[] = {
     {"json-status",     SET_status_json,        F_BOOL, {"status-json", 0}},
     {"min-packet",      SET_min_packet,         0,      {"min-pkt",0}},
     {"capture",         SET_capture,            0,      {0}},
-    {"nocapture",       SET_capture,            0,      {0}},
+    {"nocapture",       SET_capture,            0,      {"no-capture", 0}},
     {"SPACE",           SET_space,              0,      {0}},
     {"output-filename", SET_output_filename,    0,      {"output-file",0}},
     {"output-format",   SET_output_format,      0,      {0}},
@@ -1967,6 +2402,13 @@ struct ConfigParameter config_parameters[] = {
     {"stylesheet",      SET_output_stylesheet,  0,      {0}},
     {"script",          SET_script,             0,      {0}},
     {"SPACE",           SET_space,              0,      {0}},
+    {"tcp-mss",         SET_tcp_mss,            F_NUMABLE, {"tcpmss",0}},
+    {"tcp-wscale",      SET_tcp_wscale,         F_NUMABLE, {0}},
+    {"tcp-tsecho",      SET_tcp_tsecho,         F_NUMABLE, {0}},
+    {"tcp-sackok",      SET_tcp_sackok,         F_BOOL, {0}},
+    {"top-ports",       SET_topports,           F_NUMABLE, {"top-port",0}},
+
+    {"debug-tcp",       SET_debug_tcp,          F_BOOL, {"tcp-debug", 0}},
     {0}
 };
 
@@ -2021,7 +2463,7 @@ masscan_set_parameter(struct Masscan *masscan,
         }
         if (masscan->nic_count < index + 1)
             masscan->nic_count = index + 1;
-        sprintf_s(  masscan->nic[index].ifname,
+        snprintf(  masscan->nic[index].ifname,
                     sizeof(masscan->nic[index].ifname),
                     "%s",
                     value);
@@ -2310,7 +2752,7 @@ masscan_set_parameter(struct Masscan *masscan,
         /* The timeout for banners TCP connections */
         masscan->tcp_connection_timeout = (unsigned)parseInt(value);
     } else if (EQUALS("datadir", name)) {
-        strcpy_s(masscan->nmap.datadir, sizeof(masscan->nmap.datadir), value);
+        safe_strcpy(masscan->nmap.datadir, sizeof(masscan->nmap.datadir), value);
     } else if (EQUALS("data-length", name)) {
         unsigned x = (unsigned)strtoul(value, 0, 0);
         if (x >= 1514 - 14 - 40) {
@@ -2330,6 +2772,8 @@ masscan_set_parameter(struct Masscan *masscan,
         masscan->op = Operation_Echo;
     } else if (EQUALS("echo-all", name)) {
         masscan->op = Operation_EchoAll;
+    } else if (EQUALS("echo-cidr", name)) {
+        masscan->op = Operation_EchoCidr;
     } else if (EQUALS("excludefile", name)) {
         unsigned count1 = masscan->exclude.ipv4.count;
         unsigned count2;
@@ -2458,9 +2902,11 @@ masscan_set_parameter(struct Masscan *masscan,
 
         masscan->redis.port = port;
         masscan->output.format = Output_Redis;
-        strcpy_s(masscan->output.filename, 
+        safe_strcpy(masscan->output.filename, 
                  sizeof(masscan->output.filename), 
                  "<redis>");
+    } else if(EQUALS("redis-pwd", name)) {
+        masscan->redis.password = strdup(value);
     } else if (EQUALS("release-memory", name)) {
         fprintf(stderr, "nmap(%s): this is our default option\n", name);
     } else if (EQUALS("resume", name)) {
@@ -2578,6 +3024,25 @@ masscan_set_parameter(struct Masscan *masscan,
     }
 }
 
+static bool
+is_numable(const char *name) {
+    size_t i;
+
+    for (i=0; config_parameters[i].name; i++) {
+        if (EQUALS(config_parameters[i].name, name)) {
+            return (config_parameters[i].flags & F_NUMABLE) == F_NUMABLE;
+        } else {
+            size_t j;
+            for (j=0; config_parameters[i].alts[j]; j++) {
+                if (EQUALS(config_parameters[i].alts[j], name)) {
+                    return (config_parameters[i].flags & F_NUMABLE) == F_NUMABLE;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /***************************************************************************
  * Command-line parsing code assumes every --parm is followed by a value.
  * This is a list of the parameters that don't follow the default.
@@ -2586,7 +3051,7 @@ static int
 is_singleton(const char *name)
 {
     static const char *singletons[] = {
-        "echo", "echo-all", "selftest", "self-test", "regress",
+        "echo", "echo-all", "echo-cidr", "selftest", "self-test", "regress",
         "benchmark",
         "system-dns", "traceroute", "version",
         "version-light",
@@ -2631,32 +3096,43 @@ static void
 masscan_help()
 {
     printf(
+"usage: masscan [options] [<IP|RANGE>... -pPORT[,PORT...]]\n"
 "MASSCAN is a fast port scanner. The primary input parameters are the\n"
 "IP addresses/ranges you want to scan, and the port numbers. An example\n"
 "is the following, which scans the 10.x.x.x network for web servers:\n"
-" masscan 10.0.0.0/8 -p80\n"
+"\n"
+"    masscan 10.0.0.0/8 -p80\n"
+"\n"
 "The program auto-detects network interface/adapter settings. If this\n"
 "fails, you'll have to set these manually. The following is an\n"
 "example of all the parameters that are needed:\n"
-" --adapter-ip 192.168.10.123\n"
-" --adapter-mac 00-11-22-33-44-55\n"
-" --router-mac 66-55-44-33-22-11\n"
+"\n"
+"    --adapter-ip 192.168.10.123\n"
+"    --adapter-mac 00-11-22-33-44-55\n"
+"    --router-mac 66-55-44-33-22-11\n"
+"\n"
 "Parameters can be set either via the command-line or config-file. The\n"
 "names are the same for both. Thus, the above adapter settings would\n"
 "appear as follows in a configuration file:\n"
-" adapter-ip = 192.168.10.123\n"
-" adapter-mac = 00-11-22-33-44-55\n"
-" router-mac = 66-55-44-33-22-11\n"
+"\n"
+"    adapter-ip = 192.168.10.123\n"
+"    adapter-mac = 00-11-22-33-44-55\n"
+"    router-mac = 66-55-44-33-22-11\n"
+"\n"
 "All single-dash parameters have a spelled out double-dash equivalent,\n"
 "so '-p80' is the same as '--ports 80' (or 'ports = 80' in config file).\n"
 "To use the config file, type:\n"
-" masscan -c <filename>\n"
+"\n"
+"    masscan -c <filename>\n"
+"\n"
 "To generate a config-file from the current settings, use the --echo\n"
 "option. This stops the program from actually running, and just echoes\n"
 "the current configuration instead. This is a useful way to generate\n"
 "your first config file, or see a list of parameters you didn't know\n"
 "about. I suggest you try it now:\n"
-" masscan -p1234 --echo\n");
+"\n"
+"    masscan -p1234 --echo\n"
+"\n");
     exit(1);
 }
 
@@ -2681,17 +3157,16 @@ masscan_load_database_files(struct Masscan *masscan)
     }
 
     /*
-     * "nmap-payloads"
+     * `--nmap-payloads`
      */
     filename = masscan->payloads.nmap_payloads_filename;
     if (filename) {
         FILE *fp;
-        int err;
         
-        
-        err = fopen_s(&fp, filename, "rt");
-        if (err || fp == NULL) {
-            perror(filename);
+        fp = fopen(filename, "rt");
+        if (fp == NULL) {
+            fprintf(stderr, "[-] FAIL: --nmap-payloads\n");
+            fprintf(stderr, "[-] %s:%s\n", filename, strerror(errno));
         } else {
             if (masscan->payloads.udp == NULL)
                 masscan->payloads.udp = payloads_udp_create();
@@ -2728,32 +3203,59 @@ masscan_command_line(struct Masscan *masscan, int argc, char *argv[])
         /*
          * --name=value
          * --name:value
-         * -- name value
+         * --name value
          */
         if (argv[i][0] == '-' && argv[i][1] == '-') {
-            if (strcmp(argv[i], "--help") == 0) {
+            const char *argname = argv[i] + 2;
+
+            if (EQUALS("help", argname)) {
                 masscan_help();
-            } else if (EQUALS("top-ports", argv[i]+2)) {
-                /* special handling here since the following parameter
-                 * is optional */
-                const char *value = "1000";
-                unsigned n;
-                
-                /* Only consume the next parameter if it's a number,
-                 * otherwise default to 10000 */
-                if (i+1 < argc && isInteger(argv[i+1])) {
-                    value = argv[++i];
+                exit(1);
+            } else if (is_numable(argname)) {
+                /* May exist by itself like a bool or take an additional
+                 * numeric argument */
+                char name2[64];
+                const char *name = argname;
+                unsigned name_length;
+                const char *value;
+
+                /* Look for:
+                 * --name=value
+                 * --name:value */
+                value = strchr(argname, '=');
+                if (value == NULL)
+                    value = strchr(&argv[i][2], ':');
+                if (value) {
+                    name_length = (unsigned)(value - name);
+                } else {
+                    /* The next parameter contains the name */
+                    if (i+1 < argc) {
+                        value = argv[i+1];
+                        if (isInteger(value) || isBoolean(value))
+                            i++;
+                        else
+                            value = "";
+                    } else
+                        value = "";
+                    name_length = (unsigned)strlen(argname);
                 }
-                n = (unsigned)parseInt(value);
-                LOG(2, "top-ports = %u\n", n);
-                masscan->top_ports = n;
-               
+
+                /* create a copy of the name */
+                if (name_length > sizeof(name2) - 1) {
+                    fprintf(stderr, "%.*s: name too long\n", name_length, name);
+                    name_length = sizeof(name2) - 1;
+                }
+                memcpy(name2, name, name_length);
+                name2[name_length] = '\0';
+
+                masscan_set_parameter(masscan, name2, value);
             } else if (EQUALS("readscan", argv[i]+2)) {
                 /* Read in a binary file instead of scanning the network*/
                 masscan->op = Operation_ReadScan;
                 
                 /* Default to reading banners */
-                masscan->is_banners = 1;
+                masscan->is_banners = true;
+                masscan->is_banners_rawudp = true;
 
                 /* This option may be followed by many filenames, therefore,
                  * skip forward in the argument list until the next
@@ -3145,8 +3647,19 @@ masscan_echo(struct Masscan *masscan, FILE *fp, unsigned is_echo_all)
         for (i=0; i<masscan->nic_count; i++)
             masscan_echo_nic(masscan, fp, i);
     }
-    
-    
+
+    /**
+     * Fix for #737, save adapter-port/source-port value or range
+     */
+    if (masscan->nic[0].src.port.first != 0) {
+        fprintf(fp, "adapter-port = %d", masscan->nic[0].src.port.first);
+        if (masscan->nic[0].src.port.first != masscan->nic[0].src.port.last) {
+            /* --adapter-port <first>-<last> */
+            fprintf(fp, "-%d", masscan->nic[0].src.port.last);
+        }
+        fprintf(fp, "\n");
+    }
+
     /*
      * Targets
      */
@@ -3194,39 +3707,54 @@ masscan_echo(struct Masscan *masscan, FILE *fp, unsigned is_echo_all)
         } while (range.begin <= range.end);
     }
     fprintf(fp, "\n");
+
+    /*
+     * IPv4 address targets
+     */
     for (i=0; i<masscan->targets.ipv4.count; i++) {
+        unsigned prefix_bits;
         struct Range range = masscan->targets.ipv4.list[i];
-        fprintf(fp, "range = ");
-        fprintf(fp, "%u.%u.%u.%u",
-                (range.begin>>24)&0xFF,
-                (range.begin>>16)&0xFF,
-                (range.begin>> 8)&0xFF,
-                (range.begin>> 0)&0xFF
-                );
-        if (range.begin != range.end) {
-            unsigned cidr_bits = count_cidr_bits(range);
-            
-            if (cidr_bits) {
-                fprintf(fp, "/%u", cidr_bits);
-            } else
-                fprintf(fp, "-%u.%u.%u.%u",
-                        (range.end>>24)&0xFF,
-                        (range.end>>16)&0xFF,
-                        (range.end>> 8)&0xFF,
-                        (range.end>> 0)&0xFF
-                        );
+
+        if (range.begin == range.end) {
+            fprintf(fp, "range = %u.%u.%u.%u",
+                    (range.begin>>24)&0xFF,
+                    (range.begin>>16)&0xFF,
+                    (range.begin>> 8)&0xFF,
+                    (range.begin>> 0)&0xFF
+                    );
+        } else if (range_is_cidr(range, &prefix_bits)) {
+            fprintf(fp, "range = %u.%u.%u.%u/%u",
+                    (range.begin>>24)&0xFF,
+                    (range.begin>>16)&0xFF,
+                    (range.begin>> 8)&0xFF,
+                    (range.begin>> 0)&0xFF,
+                    prefix_bits
+                    );
+
+        } else {
+            fprintf(fp, "range = %u.%u.%u.%u-%u.%u.%u.%u",
+                    (range.begin>>24)&0xFF,
+                    (range.begin>>16)&0xFF,
+                    (range.begin>> 8)&0xFF,
+                    (range.begin>> 0)&0xFF,
+                    (range.end>>24)&0xFF,
+                    (range.end>>16)&0xFF,
+                    (range.end>> 8)&0xFF,
+                    (range.end>> 0)&0xFF
+                    );
         }
         fprintf(fp, "\n");
     }
     for (i=0; i<masscan->targets.ipv6.count; i++) {
+        bool exact = false;
         struct Range6 range = masscan->targets.ipv6.list[i];
         ipaddress_formatted_t fmt = ipv6address_fmt(range.begin);
         
         fprintf(fp, "range = %s", fmt.string);
         if (!ipv6address_is_equal(range.begin, range.end)) {
-            unsigned cidr_bits = count_cidr6_bits(range);
+            unsigned cidr_bits = count_cidr6_bits(&range, &exact);
             
-            if (cidr_bits) {
+            if (exact && cidr_bits) {
                 fprintf(fp, "/%u", cidr_bits);
             } else {
                 fmt = ipv6address_fmt(range.end);
@@ -3234,9 +3762,91 @@ masscan_echo(struct Masscan *masscan, FILE *fp, unsigned is_echo_all)
             }
         }
         fprintf(fp, "\n");
-    }    
+    }
 }
 
+
+/***************************************************************************
+ * Prints the list of CIDR to scan to the command-line then exits.
+ * Use: provide this list to other tools. Unlike masscan -sL, it keeps
+ * the CIDR aggretated format, and does not randomize the order of output.
+ * For example, given the starting range of [10.0.0.1-10.0.0.255], this will
+ * print all the CIDR ranges that make this up:
+ *  10.0.0.1/32
+ *  10.0.0.2/31
+ *  10.0.0.4/30
+ *  10.0.0.8/29
+ *  10.0.0.16/28
+ *  10.0.0.32/27
+ *  10.0.0.64/26
+ *  10.0.0.128/25
+ ***************************************************************************/
+void
+masscan_echo_cidr(struct Masscan *masscan, FILE *fp, unsigned is_echo_all)
+{
+    unsigned i;
+    UNUSEDPARM(is_echo_all);
+
+    masscan->echo = fp;
+
+    /*
+     * For all IPv4 ranges ...
+     */
+    for (i=0; i<masscan->targets.ipv4.count; i++) {
+
+        /* Get the next range in the list */
+        struct Range range = masscan->targets.ipv4.list[i];
+
+        /* If not a single CIDR range, print all the CIDR ranges
+         * needed to completely represent this addres */
+        for (;;) {
+            unsigned prefix_length;
+            struct Range cidr;
+
+            /* Find the largest CIDR range (one that can be specified
+             * with a /prefix) at the start of this range. */
+            cidr = range_first_cidr(range, &prefix_length);
+            fprintf(fp, "%u.%u.%u.%u/%u\n",
+                    (cidr.begin>>24)&0xFF,
+                    (cidr.begin>>16)&0xFF,
+                    (cidr.begin>> 8)&0xFF,
+                    (cidr.begin>> 0)&0xFF,
+                    prefix_length
+                    );
+
+            /* If this is the last range, then stop. There are multiple
+             * ways to gets to see if we get to the end, but I think
+             * this is the best. */
+            if (cidr.end >= range.end)
+                break;
+
+            /* If the CIDR range didn't cover the entire range,
+             * then remove it from the beginning of the range
+             * and process the remainder */
+            range.begin = cidr.end+1;
+        }
+    }
+
+    /*
+     * For all IPv6 ranges...
+     */
+    for (i=0; i<masscan->targets.ipv6.count; i++) {
+        struct Range6 range = masscan->targets.ipv6.list[i];
+        bool exact = false;
+        while (!exact) {
+            ipaddress_formatted_t fmt = ipv6address_fmt(range.begin);
+            fprintf(fp, "%s", fmt.string);
+            if (range.begin.hi == range.end.hi && range.begin.lo == range.end.lo) {
+                fprintf(fp, "/128");
+                exact = true;
+            } else {
+                unsigned cidr_bits = count_cidr6_bits(&range, &exact);
+                fprintf(fp, "/%u", cidr_bits);
+            }
+            fprintf(fp, "\n");
+        }
+    }
+}
 
 /***************************************************************************
  * remove leading/trailing whitespace
@@ -3259,14 +3869,16 @@ void
 masscan_read_config_file(struct Masscan *masscan, const char *filename)
 {
     FILE *fp;
-    errno_t err;
     char line[65536];
 
-    err = fopen_s(&fp, filename, "rt");
-    if (err) {
+    fp = fopen(filename, "rt");
+    if (fp == NULL) {
         char dir[512];
         char *x;
-        perror(filename);
+        
+        fprintf(stderr, "[-] FAIL: reading configuration file\n");
+        fprintf(stderr, "[-] %s: %s\n", filename, strerror(errno));
+
         x = getcwd(dir, sizeof(dir));
         if (x)
             fprintf(stderr, "[-] cwd = %s\n", dir);
@@ -3322,24 +3934,10 @@ mainconf_selftest()
     char test[] = " test 1 ";
 
     trim(test, sizeof(test));
-    if (strcmp(test, "test 1") != 0)
-        return 1; /* failure */
-
-    {
-        struct Range range;
-
-        range.begin = 16;
-        range.end = 32-1;
-        if (count_cidr_bits(range) != 28)
-            return 1;
-
-        range.begin = 1;
-        range.end = 13;
-        if (count_cidr_bits(range) != 0)
-            return 1;
-
-
+    if (strcmp(test, "test 1") != 0) {
+        goto failure;
     }
+
 
     /* */
     {
@@ -3347,12 +3945,15 @@ mainconf_selftest()
         char *argv[] = { "foo", "bar", "-ddd", "--readscan", "xxx", "--something" };
     
         if (masscan_conf_contains("--nothing", argc, argv))
-            return 1;
+            goto failure;
 
         if (!masscan_conf_contains("--readscan", argc, argv))
-            return 1;
+            goto failure;
     }
 
     return 0;
+failure:
+    fprintf(stderr, "[+] selftest failure: config subsystem\n");
+    return 1;
 }
 

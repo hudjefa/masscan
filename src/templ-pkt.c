@@ -8,12 +8,14 @@
     appropriate changes.
 */
 #include "templ-pkt.h"
+#include "templ-tcp-hdr.h"
+#include "templ-opts.h"
 #include "massip-port.h"
 #include "proto-preprocess.h"
 #include "proto-sctp.h"
-#include "string_s.h"
+#include "util-safefunc.h"
 #include "pixie-timer.h"
-#include "logger.h"
+#include "util-logger.h"
 #include "templ-payloads.h"
 #include "syn-cookie.h"
 #include "unusedparm.h"
@@ -31,7 +33,7 @@ static unsigned char default_tcp_template[] =
     "\x08\x00"      /* Ethernet type: IPv4 */
     "\x45"          /* IP type */
     "\x00"
-    "\x00\x28"      /* total length = 40 bytes */
+    "\x00\x2c"      /* total length = 40 bytes */
     "\x00\x00"      /* identification */
     "\x00\x00"      /* fragmentation flags */
     "\xFF\x06"      /* TTL=255, proto=TCP */
@@ -43,12 +45,12 @@ static unsigned char default_tcp_template[] =
     "\0\0"          /* destination port */
     "\0\0\0\0"      /* sequence number */
     "\0\0\0\0"      /* ACK number */
-    "\x50"          /* header length */
+    "\x60"          /* header length */
     "\x02"          /* SYN */
-    "\x04\x0"        /* window fixed to 1024 */
+    "\x04\x01"      /* window fixed to 1024 */
     "\xFF\xFF"      /* checksum */
     "\x00\x00"      /* urgent pointer */
-    "\x02\x04\x05\xb4"  /* added options [mss 1460] */
+      "\x02\x04\x05\xb4"  /* opt [mss 1460] h/t @IvreRocks */
 ;
 
 static unsigned char default_udp_template[] =
@@ -357,9 +359,9 @@ struct TemplateSet templ_copy(const struct TemplateSet *templset)
     for (i=0; i<templset->count; i++) {
         const struct TemplatePacket *p1 = &templset->pkts[i];
         struct TemplatePacket *p2 = &result.pkts[i];
-        p2->ipv4.packet = MALLOC(p2->ipv4.length);
+        p2->ipv4.packet = MALLOC(2048+p2->ipv4.length);
         memcpy(p2->ipv4.packet, p1->ipv4.packet, p2->ipv4.length);
-        p2->ipv6.packet = MALLOC(p2->ipv6.length);
+        p2->ipv6.packet = MALLOC(2048+p2->ipv6.length);
         memcpy(p2->ipv6.packet, p1->ipv6.packet, p2->ipv6.length);
     }
 
@@ -1227,7 +1229,7 @@ _template_init(
     unsigned char *px;
     struct PreprocessedInfo parsed;
     unsigned x;
-
+    
     /*
      * Create the new template structure:
      * - zero it out
@@ -1378,10 +1380,14 @@ template_packet_init(
     struct PayloadsUDP *udp_payloads,
     struct PayloadsUDP *oproto_payloads,
     int data_link,
-    uint64_t entropy)
+    uint64_t entropy,
+    const struct TemplateOptions *templ_opts)
 {
+    unsigned char *buf;
+    size_t length;
     templset->count = 0;
     templset->entropy = entropy;
+
 
     /* [SCTP] */
     _template_init(&templset->pkts[Proto_SCTP],
@@ -1392,12 +1398,17 @@ template_packet_init(
     templset->count++;
 
     /* [TCP] */
+    length = sizeof(default_tcp_template) - 1;
+    buf = MALLOC(length);
+    memcpy(buf, default_tcp_template, length);
+    templ_tcp_apply_options(&buf, &length, templ_opts);
     _template_init(&templset->pkts[Proto_TCP],
                    source_mac, router_mac_ipv4, router_mac_ipv6,
-                   default_tcp_template,
-                   sizeof(default_tcp_template)-1,
+                   buf,
+                   length,
                    data_link);
     templset->count++;
+    free(buf);
 
     /* [UDP] */
     _template_init(&templset->pkts[Proto_UDP],
@@ -1515,6 +1526,14 @@ template_selftest(void)
 {
     struct TemplateSet tmplset[1];
     int failures = 0;
+    struct TemplateOptions templ_opts = {{0}};
+
+    /* Test the module that edits TCP headers */
+    if (templ_tcp_selftest()) {
+        fprintf(stderr, "[-] templ-tcp-hdr: selftest failed\n");
+        return 1;
+    }
+
 
     memset(tmplset, 0, sizeof(tmplset[0]));
     template_packet_init(
@@ -1525,7 +1544,8 @@ template_selftest(void)
             0,  /* UDP payloads = empty */
             0,  /* Oproto payloads = empty */
             1,  /* Ethernet */
-            0   /* no entropy */
+            0,  /* no entropy */
+            &templ_opts
             );
     failures += tmplset->pkts[Proto_TCP].proto  != Proto_TCP;
     failures += tmplset->pkts[Proto_UDP].proto  != Proto_UDP;

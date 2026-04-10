@@ -3,9 +3,9 @@
     generator.
 */
 
-#include "rand-lcg.h"
-#include "rand-primegen.h" /* DJB's prime factoring code */
-#include "string_s.h"
+#include "crypto-lcg.h"
+#include "crypto-primegen.h" /* DJB's prime factoring code */
+#include "util-safefunc.h"
 #include "util-malloc.h"
 
 #include <math.h>  /* for 'sqrt()', may need -lm for gcc */

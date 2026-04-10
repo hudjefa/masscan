@@ -9,6 +9,8 @@
 #include "unusedparm.h"
 #include "masscan-app.h"
 
+#define MAX_BANNER_LENGTH 8192
+
 struct Masscan;
 struct Output;
 enum ApplicationProtocol;
@@ -79,7 +81,8 @@ struct Output
         char *directory;
     } rotate;
 
-    unsigned is_banner:1;
+    unsigned is_banner:1;           /* --banners */
+    unsigned is_banner_rawudp:1;    /* --rawudp */
     unsigned is_gmt:1; /* --gmt */
     unsigned is_interactive:1; /* echo to command line */
     unsigned is_show_open:1; /* show open ports (default) */
@@ -116,6 +119,7 @@ struct Output
     struct {
         ipaddress ip;
         unsigned port;
+        char *password;
         ptrdiff_t fd;
         uint64_t outstanding;
         unsigned state;

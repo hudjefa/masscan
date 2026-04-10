@@ -1,7 +1,7 @@
 #ifndef MASSCAN_H
 #define MASSCAN_H
 #include "massip-addr.h"
-#include "string_s.h"
+#include "util-safefunc.h"
 #include "stack-src.h"
 #include "massip.h"
 #include "util-bool.h"
@@ -16,6 +16,7 @@
 struct Adapter;
 struct TemplateSet;
 struct Banner1;
+struct TemplateOptions;
 
 /**
  * This is the "operation" to be performed by masscan, which is almost always
@@ -36,6 +37,7 @@ enum Operation {
     Operation_Benchmark = 8,        /* --benchmark */
     Operation_Echo = 9,             /* --echo */
     Operation_EchoAll = 10,         /* --echo-all */
+    Operation_EchoCidr = 11,        /* --echo-cidr */
 };
 
 /**
@@ -111,7 +113,9 @@ struct Masscan
     } scan_type;
     
     /**
-     * After scan type has been configured, add these ports
+     * After scan type has been configured, add these ports. In other words,
+     * the user may specify `-sU` or `-sT` after the `--top-ports` parameter,
+     * so we have to wait until after parsing arguments to fill in the ports.
      */
     unsigned top_ports;
     
@@ -183,6 +187,7 @@ struct Masscan
     unsigned is_pfring:1;       /* --pfring */
     unsigned is_sendq:1;        /* --sendq */
     unsigned is_banners:1;      /* --banners */
+    unsigned is_banners_rawudp:1; /* --rawudp */
     unsigned is_offline:1;      /* --offline */
     unsigned is_noreset:1;      /* --noreset, don't transmit RST */
     unsigned is_gmt:1;          /* --gmt, all times in GMT */
@@ -201,7 +206,11 @@ struct Masscan
     unsigned is_hello_http:1;    /* --hello=http, use HTTP on all ports */
     unsigned is_scripting:1;    /* whether scripting is needed */
     unsigned is_capture_servername:1; /* --capture servername */
-        
+
+    /** Packet template options, such as whether we should add a TCP MSS
+     * value, or remove it from the packet */
+    struct TemplateOptions *templ_opts; /* e.g. --tcpmss */
+
     /**
      * Wait forever for responses, instead of the default 10 seconds
      */
@@ -448,6 +457,7 @@ struct Masscan
 
     struct {
         ipaddress ip;
+        char    *password;
         unsigned port;
     } redis;
 
@@ -534,5 +544,11 @@ masscan_initialize_adapter(
  */
 void
 masscan_echo(struct Masscan *masscan, FILE *fp, unsigned is_echo_all);
+
+/**
+ * Echoes the list of CIDR ranges to scan.
+ */
+void
+masscan_echo_cidr(struct Masscan *masscan, FILE *fp, unsigned is_echo_all);
 
 #endif

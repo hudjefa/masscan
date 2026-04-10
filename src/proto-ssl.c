@@ -46,11 +46,11 @@
     open TCP connections with minimal memory usage.
  */
 #include "proto-ssl.h"
-#include "proto-interactive.h"
+#include "stack-tcp-api.h"
 #include "unusedparm.h"
 #include "masscan-app.h"
-#include "siphash24.h"
-#include "string_s.h"
+#include "crypto-siphash24.h"
+#include "util-safefunc.h"
 #include "util-malloc.h"
 #include <string.h>
 #include <ctype.h>
@@ -72,7 +72,7 @@ BANNER_CIPHER(struct BannerOutput *banout, unsigned cipher_suite)
 {
     //const char *notes = "";
     char foo[64];
-    sprintf_s(foo, sizeof(foo), "cipher:0x%x", cipher_suite);
+    snprintf(foo, sizeof(foo), "cipher:0x%x", cipher_suite);
     banout_append(banout, PROTO_SSL3, foo, AUTO_LEN);
     
     /*switch (cipher_suite) {
@@ -110,7 +110,7 @@ BANNER_VERSION(struct BannerOutput *banout, unsigned version_major,
             banout_append(banout, PROTO_SSL3, "TLS/1.3 ", AUTO_LEN);
             break;
         default:
-            sprintf_s(foo, sizeof(foo), "SSLver[%u,%u] ", 
+            snprintf(foo, sizeof(foo), "SSLver[%u,%u] ", 
                       version_major,
                       version_minor);
             banout_append(banout, PROTO_SSL3, foo, strlen(foo));
@@ -128,10 +128,10 @@ static void
 parse_server_hello(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     struct SSL_SERVER_HELLO *hello = &pstate->sub.ssl.x.server_hello;
     unsigned state = hello->state;
@@ -155,7 +155,7 @@ parse_server_hello(
     UNUSEDPARM(banout);
     UNUSEDPARM(banner1_private);
     UNUSEDPARM(banner1);
-    UNUSEDPARM(more);
+    UNUSEDPARM(socket);
 
     /* What this structure looks like in ASN.1 format
        struct {
@@ -371,10 +371,10 @@ static void
 parse_server_cert(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     struct SSL_SERVER_CERT *data = &pstate->sub.ssl.x.server_cert;
     unsigned state = data->state;
@@ -385,11 +385,14 @@ parse_server_cert(
         LEN0, LEN1, LEN2,
         CLEN0, CLEN1, CLEN2,
         CERT,
+        CALEN0, CALEN1, CALEN2,
+        CACERT,
         UNKNOWN,
     };
 
     UNUSEDPARM(banner1);
     UNUSEDPARM(banner1_private);
+    UNUSEDPARM(socket);
 
     for (i=0; i<length; i++)
     switch (state) {
@@ -404,6 +407,7 @@ parse_server_cert(
         DROPDOWN(i,length,state);
 
     case CLEN0:
+    case CALEN0:
         if (remaining < 3) {
             state = UNKNOWN;
             continue;
@@ -412,10 +416,12 @@ parse_server_cert(
         remaining--;
         DROPDOWN(i,length,state);
     case CLEN1:
+    case CALEN1:
         cert_remaining = cert_remaining * 256 + px[i];
         remaining--;
         DROPDOWN(i,length,state);
     case CLEN2:
+    case CALEN2:
         cert_remaining = cert_remaining * 256 + px[i];
         remaining--;
         if (banner1->is_capture_cert) {
@@ -432,8 +438,10 @@ parse_server_cert(
         DROPDOWN(i,length,state);
 
     case CERT:
+    case CACERT:
         {
             unsigned len = (unsigned)length-i;
+	    unsigned proto = (state == CERT ? PROTO_X509_CERT : PROTO_X509_CACERT);
             if (len > remaining)
                 len = remaining;
             if (len > cert_remaining)
@@ -442,7 +450,7 @@ parse_server_cert(
             /* parse the certificate */
             if (banner1->is_capture_cert) {
                 banout_append_base64(banout, 
-                             PROTO_X509_CERT, 
+                             proto,
                              px+i, len,
                              &pstate->base64);
             }
@@ -459,14 +467,17 @@ parse_server_cert(
                  * a record of it */
                 if (banner1->is_capture_cert) {
                     banout_finalize_base64(banout, 
-                                           PROTO_X509_CERT, 
+                                           proto,
                                            &pstate->base64);        
-                    banout_end(banout, PROTO_X509_CERT);
+                    banout_end(banout, proto);
                 }
-                state = CLEN0;
+                state = CALEN0;
                 if (remaining == 0) {
-                    if (!banner1->is_heartbleed)
-                        tcp_close(more);
+                    /* FIXME: reduce this logic, it should only flush the
+                     * FIXME: ertificate, not close the connection*/
+                    if (!banner1->is_heartbleed) {
+                        ; //tcpapi_close(socket);
+                    }
                 }
             }
         }
@@ -512,10 +523,10 @@ static void
 parse_handshake(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     struct SSLRECORD *ssl = &pstate->sub.ssl;
     unsigned state = ssl->handshake.state;
@@ -573,7 +584,7 @@ parse_handshake(
             static const char heartbleed_request[] = 
                 "\x15\x03\x02\x00\x02\x01\x80"
                 "\x18\x03\x02\x00\x03\x01" "\x40\x00";
-            tcp_transmit(more, heartbleed_request, sizeof(heartbleed_request)-1, 0);
+            tcpapi_send(socket, heartbleed_request, sizeof(heartbleed_request)-1, 0);
         }
         DROPDOWN(i,length,state);
 
@@ -611,7 +622,7 @@ parse_handshake(
                                        pstate,
                                        px+i, len,
                                        banout,
-                                       more);
+                                       socket);
                     break;
                 case 11: /* server certificate */
                     parse_server_cert(  banner1,
@@ -619,7 +630,7 @@ parse_handshake(
                                       pstate,
                                       px+i, len,
                                       banout,
-                                      more);
+                                      socket);
                     break;
             }
 
@@ -658,10 +669,10 @@ static void
 parse_heartbeat(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     struct SSLRECORD *ssl = &pstate->sub.ssl;
     unsigned state = ssl->handshake.state;
@@ -674,7 +685,7 @@ parse_heartbeat(
         UNKNOWN,
     };
 
-    UNUSEDPARM(more);
+    UNUSEDPARM(socket);
     UNUSEDPARM(banner1_private);
 
     /*
@@ -778,10 +789,10 @@ static void
 parse_alert(
                 const struct Banner1 *banner1,
                 void *banner1_private,
-                struct ProtocolState *pstate,
+                struct StreamState *pstate,
                 const unsigned char *px, size_t length,
                 struct BannerOutput *banout,
-                struct InteractiveData *more)
+                struct stack_handle_t *socket)
 {
     struct SSLRECORD *ssl = &pstate->sub.ssl;
     unsigned state = ssl->handshake.state;
@@ -793,7 +804,7 @@ parse_alert(
         UNKNOWN,
     };
     
-    UNUSEDPARM(more);
+    UNUSEDPARM(socket);
     UNUSEDPARM(banner1_private);
     
     /*
@@ -826,7 +837,7 @@ parse_alert(
                         default:
                             banout_append(banout, PROTO_SAFE, 
                                           "poodle[no-SSLv3] ", AUTO_LEN);
-                            sprintf_s(foo, sizeof(foo), " ALERT(0x%02x%02x) ",
+                            snprintf(foo, sizeof(foo), " ALERT(0x%02x%02x) ",
                                       ssl->x.server_alert.level,
                                       ssl->x.server_alert.description
                                       );
@@ -836,7 +847,7 @@ parse_alert(
                     }
                 } else {
                     char foo[64];
-                    sprintf_s(foo, sizeof(foo), " ALERT(0x%02x%02x) ",
+                    snprintf(foo, sizeof(foo), " ALERT(0x%02x%02x) ",
                               ssl->x.server_alert.level,
                               ssl->x.server_alert.description
                               );
@@ -882,10 +893,10 @@ static void
 ssl_parse_record(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     unsigned state = pstate->state;
     unsigned remaining = pstate->remaining;
@@ -909,7 +920,7 @@ ssl_parse_record(
             
     /* 
      * The initial state parses the "type" byte. There are only a few types
-     * defined so far, the values 20-25, but more can be defined in the 
+     * defined so far, the values 20-25, but socket can be defined in the
      * future. The standard explicitly says that they must be lower than 128,
      * so if the high-order bit is set, we know that the byte is invalid,
      * and that something is wrong.
@@ -992,7 +1003,7 @@ ssl_parse_record(
                                     pstate,
                                     px+i, len,
                                     banout,
-                                    more);
+                                    socket);
                     break;
                 case 22: /* handshake */
                     parse_handshake(banner1,
@@ -1000,7 +1011,7 @@ ssl_parse_record(
                                     pstate,
                                     px+i, len,
                                     banout,
-                                    more);
+                                    socket);
                     break;
                 case 23: /* application data */
                     /* encrypted, always*/
@@ -1012,7 +1023,7 @@ ssl_parse_record(
                                     pstate,
                                     px+i, len,
                                     banout,
-                                    more);
+                                    socket);
                     break;
             }
             
@@ -1064,64 +1075,49 @@ ssl_init(struct Banner1 *banner1)
  *****************************************************************************/
 static const char
 ssl_hello_template[] =
-"\x16\x03\x02\x01\x6f"          /* TLSv1.1 record layer */
+"\x16\x03\x01\x00\xc1"          /* TLSv1.0 record layer */
 "\x01" /* type = client-hello */
-"\x00\x01\x6b" /* length = 363 */
-"\x03\x02"      /* version = 3.02 (TLS 1.1) */
+"\x00\x00\xbd" /* length = 193 */
+"\x03\x03"      /* version = 3.03 (TLS 1.2) */
 
-"\x52\x48\xc5\x1a\x23\xf7\x3a\x4e\xdf\xe2\xb4\x82\x2f\xff\x09\x54" /* random */
-"\x9f\xa7\xc4\x79\xb0\x68\xc6\x13\x8c\xa4\x1c\x3d\x22\xe1\x1a\x98" /* TODO: re-randomize for each request, or at least on startup */
+"\x97\xe5\x60\x50\xc4\xa5\x4a\xe0\xb9\x01\x75\x15\x31\x23\x27\x68" /* random */
+"\x87\xdc\x3d\x66\xec\x07\xdc\xa0\xe5\x1f\x1f\xa1\x3f\x49\xf8\xfc" /* TODO: re-randomize for each request, or at least on startup */
 
-"\x20" /* session-id-length = 32 */
-"\x84\xb4\x2c\x85\xaf\x6e\xe3\x59\xbb\x62\x68\x6c\xff\x28\x3d\x27"  /* random */
-"\x3a\xa9\x82\xd9\x6f\xc8\xa2\xd7\x93\x98\xb4\xef\x80\xe5\xb9\x90"  /* TODO: re-randomize for each request, or at least on startup */
+"\x00"/* session-id-length = 0 */
 
-"\x00\x28" /* cipher suites length */
-"\xc0\x0a\xc0\x14\x00\x39\x00\x6b\x00\x35\x00\x3d\xc0\x07\xc0\x09"
-"\xc0\x23\xc0\x11\xc0\x13\xc0\x27\x00\x33\x00\x67\x00\x32\x00\x05"
-"\x00\x04\x00\x2f\x00\x3c\x00\x0a"
+"\x00\x3c" /* cipher suites length */
+"\xc0\x2b\xcc\xa9\xc0\x2c\xc0\x09\xc0\x0a\xc0\x23\xc0\x24\xc0\x2f"
+"\xcc\xa8\xc0\x30\xc0\x13\xc0\x14\xc0\x27\xc0\x28\x00\x9e\xcc\xaa"
+"\x00\x9f\x00\x33\x00\x39\x00\x67\x00\x6b\x00\x9c\x00\x9d\x00\x3c"
+"\x00\x3d\x00\x2f\x00\x35\x00\x0a\x00\x05\x00\xff"
 
 "\x01" /* compression-methods-length = 1 */
 "\x00"
 
-"\x00\xfa" /* extensions length */
-
-/* server name */
-"\xef\x00"
-"\x00\x1a"
-"\x00\x18\x00\x00\x15\x73\x79\x6e\x64\x69\x63\x61\x74\x69\x6f\x6e"
-"\x2e\x74\x77\x69\x6d\x67\x2e\x63\x6f\x6d"
-
-"\xff\x01"
-"\x00\x01"
-"\x00"
-
-"\x00\x0a"
-"\x00\x08"
-"\x00\x06\x00\x17\x00\x18\x00\x19"
-
-"\x00\x0b"
-"\x00\x02"
-"\x01\x00"
-
-"\x00\x23"
-"\x00\xb0"
-"\x81\x01\x19\x67\x60\x1e\x04\x42\x9a\xf3\xe2\x3c\x86\x58\x4f\x87"
-"\x69\x44\xb0\x1d\x8e\x01\xfa\xa5\x87\x3d\x5d\xdc\x16\x4c\xb4\x20"
-"\xda\xd3\x42\xb0\x88\xec\x0a\x13\xc3\xc6\x4c\x44\x74\x7d\xf5\x83"
-"\x93\xeb\x16\x60\x7e\x47\x07\x15\xae\x68\x3f\x32\xfc\x28\x71\xdd"
-"\x8d\x2a\xe0\x9e\x03\xad\x28\xd9\x89\x2f\x0f\x07\xaf\xc1\x27\x8e"
-"\xf1\x57\xfb\xc6\xc4\xd4\x56\x3a\xf6\xed\x59\x61\x4a\x17\x14\x0b"
-"\xd7\x7c\xae\xfe\x55\xd9\x7a\xa6\xf6\xc6\x57\xb5\x3c\xed\x78\x9d"
-"\xee\x39\xd8\x67\x02\x09\x92\xcb\xa5\x66\xa3\x48\x3d\x06\xed\xa5"
-"\x02\x2e\x9b\x16\xf6\x2b\xe7\x3f\x79\x65\x1a\xcb\x6c\x5c\xbd\x6b"
-"\xad\x11\xde\xbe\xdf\x35\xdb\x0b\xff\x2c\x90\x94\x32\xb5\x94\x57"
-"\x3d\x5e\x25\xd2\x1b\xd2\x44\x85\x96\x31\x28\x69\xd7\x4a\x13\x0a"
-"\x33\x74\x00\x00\x75\x4f\x00\x00\x00\x05\x00\x05\x01\x00\x00\x00"
-"\x00"
+"\x00\x58" /* extensions length = 88 */
+/* extensions */
+"\x00\x0b\x00\x04\x03\x00\x01\x02\x00\x0a\x00\x0c\x00\x0a\x00\x1d"
+"\x00\x17\x00\x1e\x00\x19\x00\x18\x00\x23\x00\x00\x00\x16\x00\x00"
+"\x00\x17\x00\x00\x00\x0d\x00\x30\x00\x2e\x04\x03\x05\x03\x06\x03"
+"\x08\x07\x08\x08\x08\x09\x08\x0a\x08\x0b\x08\x04\x08\x05\x08\x06"
+"\x04\x01\x05\x01\x06\x01\x03\x03\x02\x03\x03\x01\x02\x01\x03\x02"
+"\x02\x02\x04\x02\x05\x02\x06\x02"
 ;
 
-
+/*****************************************************************************
+ * This is the template "Client Hello" packet that is sent to the server
+ * to initiate the SSL connection. Right now, it's statically just transmitted
+ * on to the wire.
+ * TODO: we need to make this dynamically generated, so that users can
+ * select various options.
+ *****************************************************************************/
+static const char
+ssl_12_hello_template[] =
+"\x16\x03\x01\x01\x1a"
+"\x01"
+"\x00\x01\x16"
+"\x03\x03\x02\x58\x33\x79\x5f\x71\x03\xef\x07\xfe\x36\x61\xb0\x32\x81\xaa\x99\x10\x87\x6a\x8e\x5b\xf9\x03\x93\x44\x58\x4b\x19\xff\x42\x6a\x20\x64\x84\xcd\x28\x9c\xe9\xb1\x9d\xcd\x8a\x11\x4c\x3b\x40\x1c\x90\x02\xf2\xb5\x1a\xf1\x7e\x5d\xb8\x42\xc2\x1e\x17\x1e\x59\xa4\xac\x00\x3e\x13\x02\x13\x03\x13\x01\xc0\x2c\xc0\x30\x00\x9f\xcc\xa9\xcc\xa8\xcc\xaa\xc0\x2b\xc0\x2f\x00\x9e\xc0\x24\xc0\x28\x00\x6b\xc0\x23\xc0\x27\x00\x67\xc0\x0a\xc0\x14\x00\x39\xc0\x09\xc0\x13\x00\x33\x00\x9d\x00\x9c\x00\x3d\x00\x3c\x00\x35\x00\x2f\x00\xff\x01\x00\x00\x8f\x00\x0b\x00\x04\x03\x00\x01\x02\x00\x0a\x00\x0c\x00\x0a\x00\x1d\x00\x17\x00\x1e\x00\x19\x00\x18\x00\x23\x00\x00\x00\x16\x00\x00\x00\x17\x00\x00\x00\x0d\x00\x2a\x00\x28\x04\x03\x05\x03\x06\x03\x08\x07\x08\x08\x08\x09\x08\x0a\x08\x0b\x08\x04\x08\x05\x08\x06\x04\x01\x05\x01\x06\x01\x03\x03\x03\x01\x03\x02\x04\x02\x05\x02\x06\x02\x00\x2b\x00\x09\x08\x03\x04\x03\x03\x03\x02\x03\x01\x00\x2d\x00\x02\x01\x01\x00\x33\x00\x26\x00\x24\x00\x1d\x00\x20\xb6\x87\xb7\x72\xb9\xcb\x07\xe0\x14\x0a\x14\x81\x3f\x3f\x0a\xcc\xc4\x7d\x80\xf7\xe8\xaa\x1e\x73\xb0\xa9\xad\xb8\x3a\xa7\x3c\x64";
+;
 /*****************************************************************************
  *****************************************************************************/
 static char *
@@ -1274,11 +1270,11 @@ static int
 ssl_selftest(void)
 {
     struct Banner1 *banner1;
-    struct ProtocolState state[1];
+    struct StreamState state[1];
     unsigned ii;
     struct BannerOutput banout1[1];
     struct BannerOutput banout2[1];
-    struct InteractiveData more;
+
     unsigned x;
 
     /*
@@ -1353,7 +1349,7 @@ ssl_selftest(void)
                          ssl_test_case_3+i,
                          1,
                          banout1,
-                         &more
+                         0
                          );
     }
     /*if (0) {
@@ -1388,7 +1384,7 @@ ssl_selftest(void)
                 (const unsigned char *)ssl_test_case_3+ii,
                 1,
                 banout2,
-                &more
+                0
                 );
     banner1_destroy(banner1);
     banout_release(banout2);
@@ -1436,10 +1432,20 @@ ssl_selftest(void)
  * This is the 'plugin' structure that registers callbacks for this parser in
  * the main system.
  *****************************************************************************/
-struct ProtocolParserStream banner_ssl = {
-    "ssl", 443, ssl_hello_template, sizeof(ssl_hello_template)-1, 0,
+struct ProtocolParserStream banner_ssl_12 = {
+    "ssl", 443, ssl_12_hello_template, sizeof(ssl_12_hello_template)-1, 0,
     ssl_selftest,
     ssl_init,
     ssl_parse_record,
 };
 
+struct ProtocolParserStream banner_ssl = {
+    "ssl", 443, ssl_hello_template, sizeof(ssl_hello_template)-1,
+    SF__close, /* send FIN after the hello */
+    ssl_selftest,
+    ssl_init,
+    ssl_parse_record,
+    0,
+    0,
+    &banner_ssl_12,
+};

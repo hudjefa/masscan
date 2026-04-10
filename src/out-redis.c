@@ -1,7 +1,7 @@
 #include "output.h"
 #include "masscan.h"
 #include "pixie-sockets.h"
-#include "logger.h"
+#include "util-logger.h"
 #include <ctype.h>
 
 /****************************************************************************
@@ -149,11 +149,34 @@ clean_response_queue(struct Output *out, SOCKET fd)
 static void
 redis_out_open(struct Output *out, FILE *fp)
 {
+    /*FIXME: why did I write this code using ptrdiff_t? */
     ptrdiff_t fd = (ptrdiff_t)fp;
     size_t count;
-    unsigned char line[1024];
+    char line[1024];
 
     UNUSEDPARM(out);
+    if (out->redis.password != NULL)
+    {
+        snprintf(line, sizeof(line),
+                  "*2\r\n"
+                  "$4\r\nAUTH\r\n"
+                  "$%u\r\n%s\r\n",
+                  (unsigned)strlen(out->redis.password), out->redis.password);
+
+        count = send((SOCKET)fd, line, (int)strlen(line), 0);
+        if (count != strlen(line))
+        {
+            LOG(0, "redis: error auth\n");
+            exit(1);
+        }
+
+        count = recv_line((SOCKET)fd, line, sizeof(line));
+        if (count != 5 && memcmp(line, "+OK\r\n", 5) != 0)
+        {
+            LOG(0, "redis: unexpected response from redis server: %s\n", line);
+            exit(1);
+        }
+    }
 
     count = send((SOCKET)fd, "PING\r\n", 6, 0);
     if (count != 6) {
@@ -210,8 +233,8 @@ redis_out_status(struct Output *out, FILE *fp, time_t timestamp,
     int values_length;
     ipaddress_formatted_t fmt = ipaddress_fmt(ip);
 
-    ip_string_length = sprintf_s(ip_string, sizeof(ip_string), "%s", fmt.string);
-    port_string_length = sprintf_s(port_string, sizeof(port_string), "%u/%s", port, name_from_ip_proto(ip_proto));
+    ip_string_length = snprintf(ip_string, sizeof(ip_string), "%s", fmt.string);
+    port_string_length = snprintf(port_string, sizeof(port_string), "%u/%s", port, name_from_ip_proto(ip_proto));
 
 /**3
 $3
@@ -226,7 +249,7 @@ myvalue
      * KEY: "host"
      * VALUE: ip
      */
-    sprintf_s(line, sizeof(line),
+    snprintf(line, sizeof(line),
             "*3\r\n"
             "$4\r\nSADD\r\n"
             "$%d\r\n%s\r\n"
@@ -247,7 +270,7 @@ myvalue
      * KEY: ip
      * VALUE: port
      */
-    sprintf_s(line, sizeof(line),
+    snprintf(line, sizeof(line),
             "*3\r\n"
             "$4\r\nSADD\r\n"
             "$%d\r\n%s\r\n"
@@ -268,9 +291,9 @@ myvalue
      * KEY: ip:port
      * VALUE: timestamp:status:reason:ttl
      */
-    values_length = sprintf_s(values, sizeof(values), "%u:%u:%u:%u",
+    values_length = snprintf(values, sizeof(values), "%u:%u:%u:%u",
         (unsigned)timestamp, status, reason, ttl);
-    line_length = sprintf_s(line, sizeof(line),
+    line_length = snprintf(line, sizeof(line),
             "*3\r\n"
             "$4\r\nSADD\r\n"
             "$%d\r\n%s:%s\r\n"

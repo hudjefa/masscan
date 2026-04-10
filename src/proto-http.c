@@ -1,13 +1,13 @@
 #include "proto-http.h"
 #include "proto-banner1.h"
-#include "proto-interactive.h"
+#include "stack-tcp-api.h"
 #include "smack.h"
 #include "unusedparm.h"
-#include "string_s.h"
+#include "util-safefunc.h"
 #include "masscan-app.h"
 #include "util-malloc.h"
 #include "util-bool.h"
-#include "proto-tcp.h"
+#include "stack-tcp-core.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -61,7 +61,8 @@ _http_append(unsigned char **inout_header, size_t length1, size_t length2, const
 }
 
 enum What {spaces, notspaces, end_of_line, end_of_field};
-size_t _skip(enum What what, const unsigned char *hdr, size_t offset, size_t header_length)
+static size_t
+_skip(enum What what, const unsigned char *hdr, size_t offset, size_t header_length)
 {
     switch (what) {
     case notspaces:
@@ -221,7 +222,8 @@ http_change_requestline(unsigned char **hdr, size_t header_length,
     return header_length;
 }
 
-size_t _field_length(const unsigned char *hdr, size_t offset, size_t hdr_length)
+static size_t
+_field_length(const unsigned char *hdr, size_t offset, size_t hdr_length)
 {
     size_t original_offset = offset;
 
@@ -383,7 +385,11 @@ http_change_field(unsigned char **inout_header, size_t header_length,
  ***************************************************************************/
 static const char
 http_hello[] =      "GET / HTTP/1.0\r\n"
-                    "User-Agent: masscan/1.3 (https://github.com/robertdavidgraham/masscan)\r\n"
+#ifdef IVRE_BUILD
+                    "User-Agent: ivre-masscan/1.3 https://ivre.rocks/\r\n"
+#else
+                    "User-Agent: ivre-masscan/1.3 https://github.com/robertdavidgraham/\r\n"
+#endif
                     "Accept: */*\r\n"
                     //"Connection: Keep-Alive\r\n"
                     //"Content-Length: 0\r\n"
@@ -482,10 +488,10 @@ static void
 http_parse(
         const struct Banner1 *banner1,
         void *banner1_private,
-        struct ProtocolState *pstate,
+        struct StreamState *pstate,
         const unsigned char *px, size_t length,
         struct BannerOutput *banout,
-        struct InteractiveData *more)
+        struct stack_handle_t *socket)
 {
     unsigned state = pstate->state;
     unsigned i;
@@ -506,7 +512,7 @@ http_parse(
     };
 
     UNUSEDPARM(banner1_private);
-    UNUSEDPARM(more);
+    UNUSEDPARM(socket);
 
     state2 = (state>>16) & 0xFFFF;
     id = (state>>8) & 0xFF;
@@ -517,7 +523,7 @@ http_parse(
     case 0: case 1: case 2: case 3: case 4:
         if (toupper(px[i]) != "HTTP/"[state]) {
             state = DONE_PARSING;
-            tcp_close(more);
+            tcpapi_close(socket);
         } else
             state++;
         break;
@@ -526,7 +532,7 @@ http_parse(
             state++;
         else if (!isdigit(px[i])) {
             state = DONE_PARSING;
-            tcp_close(more);
+            tcpapi_close(socket);
         }
         break;
     case 6:
@@ -534,7 +540,7 @@ http_parse(
             state++;
         else if (!isdigit(px[i])) {
             state = DONE_PARSING;
-            tcp_close(more);
+            tcpapi_close(socket);
         }
         break;
     case 7:
@@ -707,13 +713,12 @@ static int
 http_selftest_parser(void)
 {
     struct Banner1 *banner1 = NULL;
-    struct ProtocolState pstate[1];
+    struct StreamState pstate[1];
     struct BannerOutput banout[1];
-    struct InteractiveData more[1];
+
     
     memset(pstate, 0, sizeof(pstate[0]));
     memset(banout, 0, sizeof(banout[0]));
-    memset(more, 0, sizeof(more[0]));
 
     /*
      * Test start
@@ -726,7 +731,7 @@ http_selftest_parser(void)
     /*
      * Run Test
      */
-    http_parse(banner1, 0, pstate, (const unsigned  char *)test_response, strlen(test_response), banout, more);
+    http_parse(banner1, 0, pstate, (const unsigned  char *)test_response, strlen(test_response), banout, 0);
     
     
     /*

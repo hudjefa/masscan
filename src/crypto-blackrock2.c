@@ -1,8 +1,8 @@
-#include "rand-blackrock.h"
+#include "crypto-blackrock.h"
 #include "pixie-timer.h"
 #include "unusedparm.h"
 #include "util-malloc.h"
-#include "string_s.h"
+#include "util-safefunc.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>

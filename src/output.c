@@ -34,18 +34,21 @@
 #include "output.h"
 #include "masscan.h"
 #include "masscan-status.h"
-#include "string_s.h"
-#include "logger.h"
 #include "proto-banner1.h"
 #include "masscan-app.h"
 #include "main-globals.h"
 #include "pixie-file.h"
 #include "pixie-sockets.h"
 #include "util-malloc.h"
+#include "util-errormsg.h"
+#include "util-logger.h"
 
 #include <limits.h>
 #include <ctype.h>
 #include <string.h>
+
+/* Put this at the bottom of the include lists because of warnings */
+#include "util-safefunc.h"
 
 
 /*****************************************************************************
@@ -102,7 +105,7 @@ status_string(enum PortStatus status)
 const char *
 reason_string(int x, char *buffer, size_t sizeof_buffer)
 {
-    sprintf_s(buffer, sizeof_buffer, "%s%s%s%s%s%s%s%s",
+    snprintf(buffer, sizeof_buffer, "%s%s%s%s%s%s%s%s",
         (x&0x01)?"fin-":"",
         (x&0x02)?"syn-":"",
         (x&0x04)?"rst-":"",
@@ -356,7 +359,7 @@ indexed_filename(const char *filename, unsigned index)
     
 
     /* format the new name */
-    sprintf_s(new_filename, new_length, "%.*s.%02u%s",
+    snprintf(new_filename, new_length, "%.*s.%02u%s",
               (unsigned)ext, filename,
               index,
               filename+ext);
@@ -390,7 +393,9 @@ output_create(const struct Masscan *masscan, unsigned thread_index)
     out->rotate.filesize = masscan->output.rotate.filesize;
     out->redis.port = masscan->redis.port;
     out->redis.ip = masscan->redis.ip;
-    out->is_banner = masscan->is_banners;
+    out->redis.password = masscan ->redis.password;
+    out->is_banner = masscan->is_banners;               /* --banners */
+    out->is_banner_rawudp = masscan->is_banners_rawudp; /* --rawudp */
     out->is_gmt = masscan->is_gmt;
     out->is_interactive = masscan->output.is_interactive;
     out->is_show_open = masscan->output.is_show_open;
@@ -547,9 +552,9 @@ output_do_rotate(struct Output *out, int is_closing)
 
     /* Get the proper timestamp for the file */
     if (out->is_gmt) {
-        err = gmtime_s(&tm, &out->rotate.last);
+        err = safe_gmtime(&tm, &out->rotate.last);
     } else {
-        err = localtime_s(&tm, &out->rotate.last);
+        err = safe_localtime(&tm, &out->rotate.last);
     }
     if (err != 0) {
         free(new_filename);
@@ -572,7 +577,7 @@ again:
             x_off = strlen(filename);
             x_len = 0;
         }
-        sprintf_s(new_filename, new_filename_size,
+        snprintf(new_filename, new_filename_size,
                       "%s/%.*s-%05u%.*s",
                 dir,
                 (unsigned)x_off, filename,
@@ -580,7 +585,7 @@ again:
                 (unsigned)x_len, filename + x_off
                 );
     } else {
-        sprintf_s(new_filename, new_filename_size,
+        snprintf(new_filename, new_filename_size,
                   "%s/%02u%02u%02u-%02u%02u%02u" "-%s",
             dir,
             tm.tm_year % 100,
@@ -633,7 +638,7 @@ again:
 
         fp = open_rotate(out, filename);
         if (fp == NULL) {
-            LOG(0, "rotate: %s: failed: %s\n", filename, strerror_x(errno));
+            LOG(0, "rotate: %s: failed: %s\n", filename, strerror(errno));
         } else {
             close_rotate(out, out->fp);
             out->fp = fp;
@@ -671,6 +676,7 @@ oui_from_mac(const unsigned char mac[6])
     switch (oui) {
     case 0x0001c0: return "Compulab";
     case 0x000732: return "Aaeon";
+    case 0x00089B: return "ICPelec";
     case 0x000c29: return "VMware";
     case 0x001075: return "Seagate";
     case 0x001132: return "Synology";
@@ -681,25 +687,39 @@ oui_from_mac(const unsigned char mac[6])
     case 0x001e06: return "Odroid";
     case 0x001ff3: return "Apple";
     case 0x002590: return "Supermicro";
+    case 0x04421A: return "Asus";
     case 0x08cc68: return "Cisco";
     case 0x0C9D92: return "Asus";
+    case 0x244BFE: return "Asus";
     case 0x244CE3: return "Amazon";
+    case 0x28CDC1: return "RPi 22-02";
     case 0x2c27d7: return "HP";
     case 0x3497f6: return "Asus";
     case 0x38f73d: return "Amazon";
+    case 0x3A3541: return "RPi 19-12";
+    case 0x3C22FB: return "Apple";
     case 0x404a03: return "Zyxel";
     case 0x4C9EFF: return "Zyxel";
     case 0x5855CA: return "Apple";
     case 0x60a44c: return "Asus";
+    case 0x640BD7: return "Apple";
     case 0x6c72e7: return "Apple";
+    case 0x8C3BAD: return "Netgear";
     case 0x9003b7: return "Parrot";
+    case 0x9009d0: return "Synology";
+    case 0x94A408: return "Trolink";
     case 0x94dbc9: return "Azurewave";
+    case 0xA0CEC8: return "CeLink";
     case 0xacbc32: return "Apple";
-    case 0xb827eb: return "Raspberry Pi";
+    case 0xb827eb: return "RPi 12-03";
     case 0xc05627: return "Belkin";
     case 0xc0c1c0: return "Cisco-Linksys";
+    case 0xD83ADD: return "RPi 22-11";
     case 0xDCA4CA: return "Apple";
+    case 0xdca632: return "RPi 19-03";
+    case 0xE45F01: return "RPi 20-07";
     case 0xe4956e: return "[random]";
+    case 0xFCECDA: return "Ubiquiti";
     default: return "";
     }
 }
@@ -762,11 +782,11 @@ output_report_status(struct Output *out, time_t timestamp, int status,
         fprintf(stdout, "\n");
         fflush(stdout);
 
-    }
-
-
-    if (fp == NULL)
+    } else if (fp == NULL) {
+        ERRMSG("no output file, use `--output-filename <filename>` to set one\n");
+        ERRMSG("for `stdout`, use `--output-filename -`\n");
         return;
+    }
 
     /* Rotate, if we've pass the time limit. Rotating the log files happens
      * inline while writing output, whenever there's output to write to the
@@ -865,7 +885,7 @@ output_report_banner(struct Output *out, time_t now,
      * line screen */
     if (out->is_interactive || out->format == 0 || out->format == Output_Interactive) {
         unsigned count;
-        char banner_buffer[4096];
+        char banner_buffer[MAX_BANNER_LENGTH];
 
         count = fprintf(stdout, "Banner on port %u/%s on %s: [%s] %s",
             port,

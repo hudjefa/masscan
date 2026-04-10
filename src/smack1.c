@@ -103,6 +103,7 @@
  ****************************************************************************/
 #include "smack.h"
 #include "smackqueue.h"
+#include "util-logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,9 +120,8 @@
 #elif defined(__FreeBSD__)
 #include <sys/types.h>
 #include <machine/cpufunc.h>
-#define __rdtsc rdtsc
-#if (__ARM_ARCH >= 6)  // V6 is the earliest arch that has a standard cyclecount
-unsigned long long rdtsc(void)
+#if (__ARM_ARCH >= 6 && __ARM_ARCH <= 7)  // V6 is the earliest arch that has a standard cyclecount
+unsigned long long __rdtsc(void)
 {
   uint32_t pmccntr;
   uint32_t pmuseren;
@@ -138,6 +138,17 @@ unsigned long long rdtsc(void)
   }
   return 0;
 }
+#elif defined(__powerpc64__)
+unsigned long long __rdtsc(void)
+{
+  unsigned long long rval;
+  __asm__ __volatile__("mfspr %%r3, 268": "=r" (rval));
+  return rval;
+}
+#elif defined(__aarch64__)
+#define __rdtsc() 0
+#else
+#define __rdtsc rdtsc
 #endif
 #elif defined (__llvm__)
 #if defined(i386) || defined(__i386__)
@@ -1669,6 +1680,7 @@ smack_benchmark(void)
         
     }
 
+    free(buf);
     return 0;
 }
 
@@ -1694,6 +1706,8 @@ smack_selftest(void)
     unsigned state = 0;
     static const size_t END_TEST_THINGY1 = 9001;
     static const size_t END_TEST_THINGY2 = 9002;
+
+    LOG(1, "[ ] smack: selftest started\n");
 
     /*
      * using SMACK is 5 steps:
@@ -1784,7 +1798,6 @@ smack_selftest(void)
     smack_destroy(s);
 
     
-
-
+    LOG(1, "[+] smack: success!\n");
     return 0;
 }

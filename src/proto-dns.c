@@ -10,7 +10,7 @@
 #include "proto-dns-parse.h"
 #include "proto-preprocess.h"
 #include "syn-cookie.h"
-#include "logger.h"
+#include "util-logger.h"
 #include "output.h"
 #include "masscan-app.h"
 #include "proto-banner1.h"
@@ -444,8 +444,6 @@ handle_dns(struct Output *out, time_t timestamp,
                 PROTO_DNS_VERSIONBIND,
                 parsed->ip_ttl,
                 px + offset, txtlen);
+        return 1;
     }
-
-
-    return 0;
 }

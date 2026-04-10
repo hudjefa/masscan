@@ -1,5 +1,5 @@
 #include "masscan-app.h"
-#include "string_s.h"
+#include "util-safefunc.h"
 
 /******************************************************************************
  * When outputting results, we call this function to print out the type of 
@@ -27,13 +27,14 @@ masscan_app_to_string(enum ApplicationProtocol proto)
     case PROTO_IMAP4:   return "imap";
     case PROTO_UDP_ZEROACCESS: return "zeroaccess";
     case PROTO_X509_CERT: return "X509";
+    case PROTO_X509_CACERT: return "X509CA";
     case PROTO_HTML_TITLE: return "title";
     case PROTO_HTML_FULL: return "html";
     case PROTO_NTP:     return "ntp";
     case PROTO_VULN:    return "vuln";
     case PROTO_HEARTBLEED:    return "heartbleed";
     case PROTO_TICKETBLEED:    return "ticketbleed";
-    case PROTO_VNC_RFB: return "vnc";
+    case PROTO_VNC_OLD: return "vnc";
     case PROTO_SAFE:    return "safe";
     case PROTO_MEMCACHED: return "memcached";
     case PROTO_SCRIPTING:      return "scripting";
@@ -42,9 +43,15 @@ masscan_app_to_string(enum ApplicationProtocol proto)
     case PROTO_TELNET:         return "telnet";
     case PROTO_RDP:            return "rdp";
     case PROTO_HTTP_SERVER:     return "http.server";
+    case PROTO_MC:              return "minecraft";
+    case PROTO_VNC_RFB:         return "vnc";
+    case PROTO_VNC_INFO:        return "vnc-info";
+    case PROTO_ISAKMP:          return "isakmp";
+        
+    case PROTO_ERROR:           return "error";
             
     default:
-        sprintf_s(tmp, sizeof(tmp), "(%u)", proto);
+        snprintf(tmp, sizeof(tmp), "(%u)", proto);
         return tmp;
     }
 }
@@ -65,7 +72,6 @@ masscan_string_to_app(const char *str)
         {"ftp",     PROTO_FTP},
         {"dns-ver", PROTO_DNS_VERSIONBIND},
         {"snmp",    PROTO_SNMP},
-        {"ssh2",    PROTO_SSH2},
         {"nbtstat", PROTO_NBTSTAT},
         {"ssl",     PROTO_SSL3},
         {"smtp",    PROTO_SMTP},
@@ -73,6 +79,7 @@ masscan_string_to_app(const char *str)
         {"pop",     PROTO_POP3},
         {"imap",    PROTO_IMAP4},
         {"x509",    PROTO_X509_CERT},
+        {"x509ca",  PROTO_X509_CACERT},
         {"zeroaccess",  PROTO_UDP_ZEROACCESS},
         {"title",       PROTO_HTML_TITLE},
         {"html",        PROTO_HTML_FULL},
@@ -80,7 +87,7 @@ masscan_string_to_app(const char *str)
         {"vuln",        PROTO_VULN},
         {"heartbleed",  PROTO_HEARTBLEED},
         {"ticketbleed", PROTO_TICKETBLEED},
-        {"vnc",         PROTO_VNC_RFB},
+        {"vnc-old",     PROTO_VNC_OLD},
         {"safe",        PROTO_SAFE},
         {"memcached",   PROTO_MEMCACHED},
         {"scripting",   PROTO_SCRIPTING},
@@ -89,13 +96,50 @@ masscan_string_to_app(const char *str)
         {"telnet",      PROTO_TELNET},
         {"rdp",         PROTO_RDP},
         {"http.server", PROTO_HTTP_SERVER},
+        {"minecraft",   PROTO_MC},
+        {"vnc",         PROTO_VNC_RFB},
+        {"vnc-info",    PROTO_VNC_INFO},
+        {"isakmp",      PROTO_ISAKMP},
         {0,0}
     };
     size_t i;
-    
+
     for (i=0; list[i].name; i++) {
         if (strcmp(str, list[i].name) == 0)
             return list[i].value;
     }
+    return 0;
+}
+
+int
+masscan_app_selftest(void) {
+    static const struct {
+        unsigned enumid;
+        unsigned expected;
+    } tests[] = {
+        {PROTO_SNMP, 7},
+        {PROTO_X509_CERT, 15},
+        {PROTO_HTTP_SERVER, 31},
+        {0,0}
+    };
+    size_t i;
+    
+    /* The ENUM contains fixed values in external files,
+     * so programmers should only add onto its end, not
+     * the middle. This self-test will verify that
+     * a programmer hasn't made this mistake.
+     */
+    for (i=0; tests[i].enumid != 0; i++) {
+        unsigned enumid = tests[i].enumid;
+        unsigned expected = tests[i].expected;
+        
+        /* YOU ADDED AN ENUM IN THE MIDDLE INSTEAD ON THE END OF THE LIST */
+        if (enumid != expected) {
+            fprintf(stderr, "[-] %s:%u fail\n", __FILE__, (unsigned)__LINE__);
+            fprintf(stderr, "[-] enum expected=%u, found=%u\n", 30, PROTO_HTTP_SERVER);
+            return 1;
+        }
+    }
+    
     return 0;
 }
