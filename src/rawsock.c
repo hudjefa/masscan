@@ -8,7 +8,7 @@
 #include "templ-pkt.h"
 #include "util-logger.h"
 #include "main-ptrace.h"
-#include "string_s.h"
+#include "string.h"
 #include "pcap/pcap.h"
 #include "stub-pfring.h"
 #include "pixie-timer.h"
